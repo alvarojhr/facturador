@@ -113,6 +113,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: Facturador v${{ steps.meta.outputs.version }}
           files: ${{ steps.meta.outputs.installer_path }}
+          overwrite_files: true
           body: ${{ github.event.inputs.notes }}
           generate_release_notes: true
           draft: false
