@@ -24,7 +24,12 @@ python run.py --input factura.zip
 ```bash
 python run_gui.py
 ```
-5) Configurar actualizaciones automaticas:
+5) Ejecutar automatizacion de Gmail -> Drive:
+```bash
+python run_mail_automation.py --once
+python run_mail_automation.py
+```
+6) Configurar actualizaciones automaticas:
 - El proyecto ya apunta a `https://facturador.ferreteriapinki.com/update_manifest.json`.
 - Si necesitas otro endpoint, edita `config/update_config.json`.
 Parametros utiles:
@@ -58,6 +63,110 @@ Parametros utiles:
 - Si el XLSX de una factura ya existe, no se sobrescribe; se conserva el archivo editado.
 - En la GUI, despues de procesar se abre automaticamente la carpeta de salida de la factura.
 - En la GUI, la app busca actualizaciones al iniciar (si `manifest_url` esta configurado) y tambien desde el boton `Buscar actualizaciones`.
+
+## Automatizacion Gmail -> Google Drive
+La automatizacion hace polling a Gmail, busca correos con adjuntos `.zip`, procesa cada ZIP con Facturador y sube la carpeta resultado (PDF + XLSX) a Google Drive.
+
+### 1) Preparar credenciales OAuth de Google
+1) En Google Cloud Console, crea un proyecto.
+2) Habilita las APIs:
+- Gmail API
+- Google Drive API
+3) Configura `OAuth consent screen` (tipo External o Internal segun tu caso).
+4) Crea credencial `OAuth client ID` de tipo `Desktop app`.
+5) Descarga el JSON y guardalo en:
+`config/google_credentials.json`
+
+### 2) Configurar carpeta destino de Drive
+1) Crea en Drive una carpeta para facturas procesadas.
+2) Abre la carpeta y copia el ID desde la URL:
+`https://drive.google.com/drive/folders/<ID_AQUI>`
+3) Edita `config/mail_automation.json` y pega el ID en:
+`drive_parent_folder_id`
+
+### 3) Configurar automatizacion
+Usa `config/mail_automation.json` (incluido en el repo). Si quieres un ejemplo limpio, revisa `config/mail_automation.example.json`.
+
+Campos clave:
+- `gmail_query`: filtro de Gmail para buscar ZIPs.
+- `processed_label_name`: etiqueta que se aplica para no reprocesar el correo.
+- `poll_interval_sec`: intervalo de consulta.
+- `drive_parent_folder_id`: carpeta destino en Drive.
+
+### 4) Primera ejecucion (autorizacion)
+```bash
+python run_mail_automation.py --once --verbose
+```
+En la primera ejecucion se abrira el navegador para autorizar acceso a Gmail/Drive.
+Se guarda token en `config/google_token.json`.
+
+### 5) Ejecucion continua
+```bash
+python run_mail_automation.py --verbose
+```
+Para detener: `Ctrl+C`.
+
+### 6) Produccion en Windows (recomendado)
+Puedes correrlo con Python o con el ejecutable instalado (`FacturadorMailAutomation.exe`).
+
+Ejemplo con `schtasks` (al iniciar sesion):
+```bash
+schtasks /Create /F /SC ONLOGON /TN "FacturadorMailAutomation" /TR "\"C:\Program Files\Facturador\FacturadorMailAutomation.exe\" --log-file \"C:\ProgramData\Facturador\mail_automation.log\""
+```
+
+Eliminar tarea:
+```bash
+schtasks /Delete /TN "FacturadorMailAutomation" /F
+```
+
+## Trigger en nube (Arquitectura 2)
+Esta opcion usa Gmail Push Notifications (`watch`) + Pub/Sub + Cloud Run + Firestore para reaccionar a correos nuevos.
+
+Componentes:
+- Cloud Run service: endpoint `/pubsub/push` y endpoints admin (`/admin/start-watch`, `/admin/full-sync`).
+- Pub/Sub topic/subscription push: recibe notificaciones de Gmail.
+- Cloud Scheduler: renueva `watch` periodicamente y ejecuta sync de respaldo.
+- Firestore: almacena `last_history_id`.
+
+### Archivos agregados para esta arquitectura
+- `src/facturador/mail_trigger_service.py`
+- `run_mail_trigger_service.py`
+- `main.py`
+- `deploy_gcp_gmail_trigger.ps1`
+
+### Despliegue productivo automatizado
+1) Instala y autentica Google Cloud SDK:
+```bash
+gcloud auth login
+```
+2) Asegura que existan estos archivos locales:
+- `config/mail_automation.json` (con `drive_parent_folder_id` listo)
+- `config/google_credentials.json`
+- `config/google_token.json`
+
+3) Ejecuta el script de despliegue:
+```bash
+powershell -ExecutionPolicy Bypass -File .\deploy_gcp_gmail_trigger.ps1 -ProjectId TU_PROJECT_ID
+```
+
+El script realiza:
+- habilitar APIs necesarias,
+- crear service accounts,
+- crear/actualizar secretos,
+- desplegar Cloud Run,
+- crear topic/subscription de Pub/Sub,
+- configurar jobs de Scheduler,
+- ejecutar `start-watch` inicial.
+
+### Variables utiles del script
+- `-Region` (default `us-central1`)
+- `-WatchLabelIds` (default `INBOX`)
+- `-WatchSchedule` (default cada 6 horas)
+- `-FullSyncSchedule` (default cada 15 minutos)
+
+### Nota para Gmail personal
+- Se usa OAuth de usuario (no service account Gmail).
+- El `google_token.json` se genera primero en local y luego se sube como secreto para Cloud Run.
 
 ## Repositorio Git (local)
 Inicializa el repo local (si aun no existe) y haz el primer commit:

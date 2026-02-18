@@ -1,0 +1,18 @@
+{
+  "gmail_query": "has:attachment filename:zip in:inbox",
+  "processed_label_name": "facturador-procesado",
+  "mark_as_read": true,
+  "poll_interval_sec": 60,
+  "max_messages_per_poll": 20,
+  "drive_parent_folder_id": "PEGA_AQUI_EL_ID_DE_LA_CARPETA_EN_DRIVE",
+  "credentials_path": "config/google_credentials.json",
+  "token_path": "config/google_token.json",
+  "local_work_dir": "automation_work",
+  "rules_path": "config/reglas_especiales.xlsx",
+  "sheet_name": "Productos",
+  "markup_threshold": "10000",
+  "markup_below": "0.68",
+  "markup_above": "1.32",
+  "round_net_step": "100",
+  "rounding_mode": "up"
+}

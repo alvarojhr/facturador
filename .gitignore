@@ -23,6 +23,12 @@ out_xml_folder/
 out_zip_folder/
 out_zip_folder2/
 out_zip_safe/
+automation_work/
+
+# Google OAuth secrets/tokens for mail automation
+config/google_credentials.json
+config/google_token.json
+config/mail_automation.json
 
 # Invoice inputs/outputs kept local
 invoices/*
