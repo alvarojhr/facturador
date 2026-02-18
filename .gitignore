@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# Build outputs
+build/
+dist/
+installer/dist-installer/
+*.spec
+
+# Local generated files
+out*.xlsx
+check.xlsx
+temp_readme.txt
+update_manifest.json
+out_xml_folder/
+out_zip_folder/
+out_zip_folder2/
+out_zip_safe/
+
+# Invoice inputs/outputs kept local
+invoices/*
+!invoices/.gitkeep
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

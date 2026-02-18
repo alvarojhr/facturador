@@ -1,0 +1,166 @@
+name: Release And Publish Manifest
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version SemVer sin prefijo v (ejemplo: 0.3.1)"
+        required: true
+        type: string
+      notes:
+        description: "Notas de la version (opcional)"
+        required: false
+        default: ""
+        type: string
+      mandatory:
+        description: "Actualizacion obligatoria"
+        required: true
+        default: false
+        type: boolean
+      publish_manifest:
+        description: "Publicar manifest en GitHub Pages"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    outputs:
+      should_publish_manifest: ${{ steps.meta.outputs.should_publish_manifest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}".Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version invalida. Usa formato SemVer, ejemplo 0.3.1"
+          }
+
+          $tag = "v$version"
+          $publishManifest = "${{ github.event.inputs.publish_manifest }}".ToLower()
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "installer_path=installer/dist-installer/FacturadorSetup.exe" >> $env:GITHUB_OUTPUT
+          "installer_name=FacturadorSetup.exe" >> $env:GITHUB_OUTPUT
+          "installer_url=https://github.com/${{ github.repository }}/releases/download/$tag/FacturadorSetup.exe" >> $env:GITHUB_OUTPUT
+          "should_publish_manifest=$publishManifest" >> $env:GITHUB_OUTPUT
+
+      - name: Update version files
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+
+          $initPath = "src/facturador/__init__.py"
+          $initText = Get-Content -Path $initPath -Raw
+          $initText = $initText -replace '__version__\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+"', "__version__ = `"$version`""
+          Set-Content -Path $initPath -Value $initText -Encoding UTF8
+
+          $issPath = "installer/Facturador.iss"
+          $issText = Get-Content -Path $issPath -Raw
+          $issText = $issText -replace 'AppVersion=[0-9]+\.[0-9]+\.[0-9]+', "AppVersion=$version"
+          Set-Content -Path $issPath -Value $issText -Encoding UTF8
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Build exe
+        shell: pwsh
+        run: ./build_exe.ps1
+
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\Facturador.iss"'
+
+      - name: Generate update manifest
+        shell: pwsh
+        run: |
+          $mandatory = "${{ github.event.inputs.mandatory }}".ToLower() -eq "true"
+          ./build_update_manifest.ps1 `
+            -InstallerPath "${{ steps.meta.outputs.installer_path }}" `
+            -Version "${{ steps.meta.outputs.version }}" `
+            -InstallerUrl "${{ steps.meta.outputs.installer_url }}" `
+            -Notes "${{ github.event.inputs.notes }}" `
+            -Mandatory:$mandatory `
+            -OutputPath "site/update_manifest.json"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Facturador v${{ steps.meta.outputs.version }}
+          files: ${{ steps.meta.outputs.installer_path }}
+          body: ${{ github.event.inputs.notes }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+      - name: Build pages artifact
+        if: steps.meta.outputs.should_publish_manifest == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path site | Out-Null
+          if (Test-Path "pages/index.html") {
+            Copy-Item "pages/index.html" "site/index.html" -Force
+          } elseif (-not (Test-Path "site/index.html")) {
+            @"
+          <!doctype html>
+          <html lang="es">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Facturador - Update Manifest</title>
+          </head>
+          <body>
+            <h1>Facturador</h1>
+            <p>Manifest: <a href="./update_manifest.json">update_manifest.json</a></p>
+          </body>
+          </html>
+          "@ | Set-Content -Path "site/index.html" -Encoding UTF8
+          }
+          Set-Content -Path "site/.nojekyll" -Value "" -Encoding ascii
+
+      - name: Configure Pages
+        if: steps.meta.outputs.should_publish_manifest == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: steps.meta.outputs.should_publish_manifest == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-pages:
+    if: needs.build-release.outputs.should_publish_manifest == 'true'
+    needs: build-release
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

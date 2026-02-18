@@ -1,0 +1,7 @@
+{
+  "version": "0.3.0",
+  "installer_url": "https://github.com/TU_USUARIO/Facturador/releases/download/v0.3.0/FacturadorSetup.exe",
+  "sha256": "PEGA_AQUI_EL_SHA256_DEL_INSTALLER",
+  "mandatory": false,
+  "notes": "Publicacion via GitHub Releases + GitHub Pages."
+}

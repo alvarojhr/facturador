@@ -1,0 +1,11 @@
+{
+  "manifest_url": "https://facturador.ferreteriapinki.com/update_manifest.json",
+  "check_on_startup": true,
+  "auto_install": false,
+  "request_timeout_sec": 8,
+  "silent_install_args": [
+    "/VERYSILENT",
+    "/NORESTART",
+    "/CLOSEAPPLICATIONS"
+  ]
+}
