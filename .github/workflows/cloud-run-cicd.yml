@@ -65,7 +65,8 @@ jobs:
         run: |
           IMAGE="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GCP_ARTIFACT_REPOSITORY }}/${{ env.GCP_IMAGE_NAME }}:${GITHUB_SHA}"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-          gcloud builds submit --region "${{ env.GCP_REGION }}" --tag "$IMAGE" .
+          docker build --tag "$IMAGE" .
+          docker push "$IMAGE"
 
       - name: Deploy revision
         run: |
