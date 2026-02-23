@@ -374,6 +374,8 @@ class MailAutomationService:
         summary.checked_messages = len(messages)
 
         if not messages:
+            if self.config.sync_entered_label:
+                self.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
             return summary
 
         for msg_ref in messages:
