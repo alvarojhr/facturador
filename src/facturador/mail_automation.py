@@ -1,6 +1,7 @@
 import base64
 from dataclasses import dataclass
 from decimal import Decimal
+import io
 import json
 import logging
 from pathlib import Path
@@ -9,9 +10,11 @@ import ssl
 import sys
 import time
 from typing import Optional
+import zipfile
 
 from googleapiclient.errors import HttpError
 
+from .invoice_parser import extract_invoice_root_from_bytes, parse_invoice_header
 from .pricing import MarkupConfig
 from .processor import ProcessResult, process_invoice
 
@@ -41,6 +44,10 @@ class MailAutomationConfig:
     local_work_dir: Path = Path("automation_work")
     rules_path: Optional[Path] = None
     sheet_name: str = "Productos"
+    entered_label_name: str = "Ingresado"
+    entered_synced_label_name: str = "facturador-drive-ingresado"
+    entered_drive_subfolder_name: str = "Ingresado"
+    sync_entered_label: bool = True
     markup_threshold: Decimal = Decimal("10000")
     markup_below: Decimal = Decimal("0.68")
     markup_above: Decimal = Decimal("1.32")
@@ -127,6 +134,14 @@ def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationCo
     cfg.rules_path = rules
 
     cfg.sheet_name = str(payload.get("sheet_name", cfg.sheet_name)).strip() or cfg.sheet_name
+    cfg.entered_label_name = str(payload.get("entered_label_name", cfg.entered_label_name)).strip()
+    cfg.entered_synced_label_name = str(
+        payload.get("entered_synced_label_name", cfg.entered_synced_label_name)
+    ).strip()
+    cfg.entered_drive_subfolder_name = str(
+        payload.get("entered_drive_subfolder_name", cfg.entered_drive_subfolder_name)
+    ).strip()
+    cfg.sync_entered_label = bool(payload.get("sync_entered_label", cfg.sync_entered_label))
     cfg.markup_threshold = Decimal(str(payload.get("markup_threshold", cfg.markup_threshold)))
     cfg.markup_below = Decimal(str(payload.get("markup_below", cfg.markup_below)))
     cfg.markup_above = Decimal(str(payload.get("markup_above", cfg.markup_above)))
@@ -139,6 +154,13 @@ def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationCo
         raise AutomationError("max_messages_per_poll debe ser >= 1.")
     if not cfg.drive_parent_folder_id:
         raise AutomationError("Configura drive_parent_folder_id con el ID de la carpeta destino en Google Drive.")
+    if cfg.sync_entered_label:
+        if not cfg.entered_label_name:
+            raise AutomationError("entered_label_name no puede ser vacio cuando sync_entered_label=true.")
+        if not cfg.entered_synced_label_name:
+            raise AutomationError("entered_synced_label_name no puede ser vacio cuando sync_entered_label=true.")
+        if not cfg.entered_drive_subfolder_name:
+            raise AutomationError("entered_drive_subfolder_name no puede ser vacio cuando sync_entered_label=true.")
     if cfg.rounding_mode not in {"up", "down", "nearest"}:
         raise AutomationError("rounding_mode invalido. Debe ser: up, down o nearest.")
 
@@ -173,6 +195,11 @@ def _message_subject(message_payload: dict) -> str:
         if str(header.get("name", "")).lower() == "subject":
             return str(header.get("value", "")).strip()
     return ""
+
+
+def _gmail_label_query(label_name: str) -> str:
+    escaped = label_name.replace('"', '\\"')
+    return f'label:"{escaped}"'
 
 
 def _iter_parts(payload: dict):
@@ -263,6 +290,11 @@ class MailAutomationService:
         (self.config.local_work_dir / "output").mkdir(parents=True, exist_ok=True)
         self.gmail, self.drive = self._build_google_services()
         self.processed_label_id = self._ensure_gmail_label(self.config.processed_label_name)
+        self.entered_label_id: Optional[str] = None
+        self.entered_synced_label_id: Optional[str] = None
+        if self.config.sync_entered_label:
+            self.entered_label_id = self._ensure_gmail_label(self.config.entered_label_name)
+            self.entered_synced_label_id = self._ensure_gmail_label(self.config.entered_synced_label_name)
 
     def _build_google_services(self):
         Request, Credentials, InstalledAppFlow, build, _ = _import_google_deps()
@@ -357,10 +389,14 @@ class MailAutomationService:
             else:
                 summary.processed_messages += 1
 
+        if self.config.sync_entered_label:
+            self.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
+
         return summary
 
     def query_unprocessed_messages(self, limit: Optional[int] = None) -> list[dict]:
-        query = f"({self.config.gmail_query}) -label:{self.config.processed_label_name}"
+        processed_query = _gmail_label_query(self.config.processed_label_name)
+        query = f"({self.config.gmail_query}) -{processed_query}"
         listed = execute_google_with_retry(
             lambda: self.gmail.users().messages().list(
                 userId="me",
@@ -370,6 +406,51 @@ class MailAutomationService:
             operation="gmail.messages.list",
         )
         return listed.get("messages", [])
+
+    def query_ingresado_pending_messages(self, limit: Optional[int] = None) -> list[dict]:
+        if not self.config.sync_entered_label:
+            return []
+
+        query = (
+            f"{_gmail_label_query(self.config.entered_label_name)} "
+            f"{_gmail_label_query(self.config.processed_label_name)} "
+            f"-{_gmail_label_query(self.config.entered_synced_label_name)} "
+            "has:attachment filename:zip"
+        )
+        listed = execute_google_with_retry(
+            lambda: self.gmail.users().messages().list(
+                userId="me",
+                q=query,
+                maxResults=limit or self.config.max_messages_per_poll,
+            ).execute(),
+            operation="gmail.messages.list.ingresado",
+        )
+        return listed.get("messages", [])
+
+    def sync_ingresado_messages(self, limit: Optional[int] = None) -> int:
+        if not self.config.sync_entered_label:
+            return 0
+
+        pending = self.query_ingresado_pending_messages(limit=limit)
+        moved_folders = 0
+        for msg_ref in pending:
+            message_id = str(msg_ref.get("id") or "").strip()
+            if not message_id:
+                continue
+
+            try:
+                moved_folders += self._sync_ingresado_message(message_id)
+                self._mark_ingresado_synced(message_id)
+            except Exception as exc:
+                LOGGER.exception("No se pudo sincronizar mensaje 'Ingresado' id=%s: %s", message_id, exc)
+
+        if pending:
+            LOGGER.info(
+                "Sincronizacion 'Ingresado' completada. mensajes=%s carpetas_movidas=%s",
+                len(pending),
+                moved_folders,
+            )
+        return moved_folders
 
     def process_message_by_id(self, message_id: str) -> tuple[int, int, bool]:
         return self._process_message(message_id)
@@ -456,6 +537,47 @@ class MailAutomationService:
 
         return attachments
 
+    def _extract_invoice_ref_from_zip_bytes(self, zip_data: bytes, fallback_name: str) -> str:
+        with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
+            xml_entries = [entry for entry in zf.infolist() if not entry.is_dir() and entry.filename.lower().endswith(".xml")]
+            if not xml_entries:
+                raise ValueError("ZIP sin XML para extraer referencia de factura.")
+
+            last_error = None
+            for entry in xml_entries:
+                try:
+                    invoice_root = extract_invoice_root_from_bytes(zf.read(entry))
+                    header = parse_invoice_header(invoice_root)
+                    if header.invoice_id:
+                        return _safe_name(header.invoice_id)
+                    return _safe_name(Path(entry.filename).stem)
+                except Exception as exc:
+                    last_error = exc
+
+        LOGGER.warning("No se pudo extraer invoice_id del ZIP (%s). Se usa fallback.", last_error)
+        return _safe_name(Path(fallback_name).stem)
+
+    def _sync_ingresado_message(self, message_id: str) -> int:
+        message = execute_google_with_retry(
+            lambda: self.gmail.users().messages().get(userId="me", id=message_id, format="full").execute(),
+            operation="gmail.messages.get.ingresado",
+        )
+        zip_attachments = self._extract_zip_attachments(message_id, message)
+        if not zip_attachments:
+            LOGGER.info("Mensaje 'Ingresado' sin adjuntos ZIP. id=%s", message_id)
+            return 0
+
+        ingresado_parent_id = self._ensure_drive_folder(
+            self.config.entered_drive_subfolder_name,
+            self.config.drive_parent_folder_id,
+        )
+        moved = 0
+        for attachment_name, data in zip_attachments:
+            invoice_ref = self._extract_invoice_ref_from_zip_bytes(data, fallback_name=attachment_name)
+            if self._move_drive_folder(invoice_ref, ingresado_parent_id):
+                moved += 1
+        return moved
+
     def _process_zip_attachment(self, message_id: str, attachment_name: str, data: bytes) -> ProcessResult:
         incoming_dir = self.config.local_work_dir / "incoming"
         zip_path = incoming_dir / f"{message_id}_{_safe_name(attachment_name)}"
@@ -487,7 +609,7 @@ class MailAutomationService:
                 continue
             self._upload_file_if_missing(item, folder_id)
 
-    def _ensure_drive_folder(self, folder_name: str, parent_id: str) -> str:
+    def _find_drive_folder(self, folder_name: str, parent_id: str) -> Optional[str]:
         escaped_name = _escape_drive_query_value(folder_name)
         escaped_parent = _escape_drive_query_value(parent_id)
         query = (
@@ -496,11 +618,17 @@ class MailAutomationService:
         )
         listed = execute_google_with_retry(
             lambda: self.drive.files().list(q=query, spaces="drive", fields="files(id,name)", pageSize=1).execute(),
-            operation="drive.files.list.folder",
+            operation="drive.files.list.find_folder",
         )
         files = listed.get("files", [])
         if files:
             return str(files[0]["id"])
+        return None
+
+    def _ensure_drive_folder(self, folder_name: str, parent_id: str) -> str:
+        existing_id = self._find_drive_folder(folder_name, parent_id)
+        if existing_id:
+            return existing_id
 
         created = execute_google_with_retry(
             lambda: self.drive.files().create(
@@ -514,6 +642,37 @@ class MailAutomationService:
             operation="drive.files.create.folder",
         )
         return str(created["id"])
+
+    def _move_drive_folder(self, folder_name: str, target_parent_id: str) -> bool:
+        source_folder_id = self._find_drive_folder(folder_name, self.config.drive_parent_folder_id)
+        if source_folder_id is None:
+            already_target_id = self._find_drive_folder(folder_name, target_parent_id)
+            if already_target_id is not None:
+                LOGGER.info("Carpeta ya ubicada en '%s': %s", self.config.entered_drive_subfolder_name, folder_name)
+            else:
+                LOGGER.warning("No se encontro carpeta en Drive para mover: %s", folder_name)
+            return False
+
+        metadata = execute_google_with_retry(
+            lambda: self.drive.files().get(fileId=source_folder_id, fields="id,name,parents").execute(),
+            operation="drive.files.get.folder_move",
+        )
+        parents = [str(item) for item in metadata.get("parents", []) if item]
+        if target_parent_id in parents and len(parents) == 1:
+            return False
+
+        remove_parents = ",".join(parent for parent in parents if parent != target_parent_id)
+        execute_google_with_retry(
+            lambda: self.drive.files().update(
+                fileId=source_folder_id,
+                addParents=target_parent_id,
+                removeParents=remove_parents,
+                fields="id,parents",
+            ).execute(),
+            operation="drive.files.update.move_folder",
+        )
+        LOGGER.info("Carpeta movida a '%s': %s", self.config.entered_drive_subfolder_name, folder_name)
+        return True
 
     def _upload_file_if_missing(self, local_file: Path, drive_folder_id: str) -> None:
         _, _, _, _, MediaFileUpload = _import_google_deps()
@@ -555,4 +714,19 @@ class MailAutomationService:
                 },
             ).execute(),
             operation="gmail.messages.modify",
+        )
+
+    def _mark_ingresado_synced(self, message_id: str) -> None:
+        if not self.entered_synced_label_id:
+            return
+        execute_google_with_retry(
+            lambda: self.gmail.users().messages().modify(
+                userId="me",
+                id=message_id,
+                body={
+                    "addLabelIds": [self.entered_synced_label_id],
+                    "removeLabelIds": [],
+                },
+            ).execute(),
+            operation="gmail.messages.modify.ingresado_synced",
         )

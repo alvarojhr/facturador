@@ -192,11 +192,13 @@ class GmailPushProcessor:
 
         if not current_history_id:
             summary = self.mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
+            moved = self.mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
             self.state.set_last_history_id(new_history_id)
             return {
                 "mode": "bootstrap_sync",
                 "new_history_id": new_history_id,
                 "summary": asdict(summary),
+                "ingresado_moved": moved,
             }
 
         try:
@@ -204,11 +206,13 @@ class GmailPushProcessor:
         except HttpError as exc:
             if getattr(exc, "resp", None) is not None and exc.resp.status == 404:
                 summary = self.mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
+                moved = self.mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
                 self.state.set_last_history_id(new_history_id)
                 return {
                     "mode": "history_gap_full_sync",
                     "new_history_id": new_history_id,
                     "summary": asdict(summary),
+                    "ingresado_moved": moved,
                 }
             raise
 
@@ -232,11 +236,13 @@ class GmailPushProcessor:
                 processed.processed_messages += 1
 
         self.state.set_last_history_id(new_history_id)
+        moved = self.mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
         return {
             "mode": "history_incremental",
             "new_history_id": new_history_id,
             "message_ids": len(message_ids),
             "summary": asdict(processed),
+            "ingresado_moved": moved,
         }
 
     def _list_message_ids_from_history(self, start_history_id: str) -> list[str]:
