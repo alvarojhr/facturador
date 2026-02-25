@@ -15,6 +15,7 @@ from googleapiclient.errors import HttpError
 from .mail_automation import (
     MailAutomationConfig,
     MailAutomationService,
+    OAuthTokenInvalidError,
     PollSummary,
     execute_google_with_retry,
     is_transient_google_error,
@@ -110,7 +111,10 @@ class GmailPushProcessor:
         config_path = Path(config_path_raw) if config_path_raw else None
         config = load_mail_automation_config(config_path)
         self.config = self._apply_env_overrides(config)
-        self.mail = MailAutomationService(self.config)
+        self.mail: Optional[MailAutomationService] = None
+        self.mail_init_lock = threading.Lock()
+        self.automation_error_reason: Optional[str] = None
+        self.automation_error_message: Optional[str] = None
 
         state_project = _str_env("FACTURADOR_STATE_PROJECT")
         state_collection = _str_env("FACTURADOR_STATE_COLLECTION", "facturador_state")
@@ -136,6 +140,33 @@ class GmailPushProcessor:
         self.watch_label_filter_action = _str_env("FACTURADOR_WATCH_LABEL_FILTER_ACTION", "include")
         self.watch_sync_after_start = _bool_env("FACTURADOR_WATCH_SYNC_AFTER_START", True)
 
+    def _set_automation_ready(self) -> None:
+        self.automation_error_reason = None
+        self.automation_error_message = None
+
+    def _set_automation_unavailable(self, reason: str, message: str) -> None:
+        self.automation_error_reason = reason
+        self.automation_error_message = message
+
+    def _ensure_mail(self) -> MailAutomationService:
+        if self.mail is not None:
+            return self.mail
+
+        with self.mail_init_lock:
+            if self.mail is not None:
+                return self.mail
+            try:
+                mail = MailAutomationService(self.config)
+            except OAuthTokenInvalidError as exc:
+                self._set_automation_unavailable(exc.reason, str(exc))
+                raise
+            except Exception as exc:
+                self._set_automation_unavailable("initialization_error", str(exc))
+                raise
+            self.mail = mail
+            self._set_automation_ready()
+            return self.mail
+
     def _apply_env_overrides(self, config: MailAutomationConfig) -> MailAutomationConfig:
         credentials_path = _str_env("FACTURADOR_CREDENTIALS_PATH")
         token_path = _str_env("FACTURADOR_TOKEN_PATH")
@@ -160,9 +191,31 @@ class GmailPushProcessor:
 
         return config
 
+    def health_status(self) -> dict:
+        try:
+            self._ensure_mail()
+        except OAuthTokenInvalidError as exc:
+            return {
+                "ok": True,
+                "automation_ready": False,
+                "reason": exc.reason,
+            }
+        except Exception as exc:
+            LOGGER.exception("Error inicializando automatizacion en healthz: %s", exc)
+            return {
+                "ok": True,
+                "automation_ready": False,
+                "reason": "initialization_error",
+            }
+        return {
+            "ok": True,
+            "automation_ready": True,
+        }
+
     def start_watch(self) -> dict:
         if not self.watch_topic:
             raise ValueError("Configura FACTURADOR_WATCH_TOPIC para iniciar watch.")
+        mail = self._ensure_mail()
 
         body: dict = {"topicName": self.watch_topic}
         if self.watch_label_ids:
@@ -170,7 +223,7 @@ class GmailPushProcessor:
             body["labelFilterAction"] = self.watch_label_filter_action
 
         response = execute_google_with_retry(
-            lambda: self.mail.gmail.users().watch(userId=self.gmail_user, body=body).execute(),
+            lambda: mail.gmail.users().watch(userId=self.gmail_user, body=body).execute(),
             operation="gmail.users.watch",
         )
         history_id = str(response.get("historyId") or "")
@@ -179,7 +232,7 @@ class GmailPushProcessor:
 
         sync = None
         if self.watch_sync_after_start:
-            summary = self.mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
+            summary = mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
             sync = asdict(summary)
 
         return {
@@ -188,11 +241,12 @@ class GmailPushProcessor:
         }
 
     def process_push_history(self, new_history_id: str) -> dict:
+        mail = self._ensure_mail()
         current_history_id = self.state.get_last_history_id()
 
         if not current_history_id:
-            summary = self.mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
-            moved = self.mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
+            summary = mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
+            moved = mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
             self.state.set_last_history_id(new_history_id)
             return {
                 "mode": "bootstrap_sync",
@@ -202,11 +256,11 @@ class GmailPushProcessor:
             }
 
         try:
-            message_ids = self._list_message_ids_from_history(current_history_id)
+            message_ids = self._list_message_ids_from_history(current_history_id, mail)
         except HttpError as exc:
             if getattr(exc, "resp", None) is not None and exc.resp.status == 404:
-                summary = self.mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
-                moved = self.mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
+                summary = mail.drain_unprocessed_messages(max_cycles=self.max_sync_cycles)
+                moved = mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
                 self.state.set_last_history_id(new_history_id)
                 return {
                     "mode": "history_gap_full_sync",
@@ -219,7 +273,7 @@ class GmailPushProcessor:
         processed = PollSummary()
         for message_id in message_ids:
             try:
-                ok_count, skip_count, failed = self.mail.process_message_by_id(message_id)
+                ok_count, skip_count, failed = mail.process_message_by_id(message_id)
             except Exception as exc:
                 if is_transient_google_error(exc):
                     raise
@@ -236,7 +290,7 @@ class GmailPushProcessor:
                 processed.processed_messages += 1
 
         self.state.set_last_history_id(new_history_id)
-        moved = self.mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
+        moved = mail.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
         return {
             "mode": "history_incremental",
             "new_history_id": new_history_id,
@@ -245,11 +299,11 @@ class GmailPushProcessor:
             "ingresado_moved": moved,
         }
 
-    def _list_message_ids_from_history(self, start_history_id: str) -> list[str]:
+    def _list_message_ids_from_history(self, start_history_id: str, mail: MailAutomationService) -> list[str]:
         ids: dict[str, bool] = {}
         page_token = None
         while True:
-            history_req = self.mail.gmail.users().history().list(
+            history_req = mail.gmail.users().history().list(
                 userId=self.gmail_user,
                 startHistoryId=str(start_history_id),
                 historyTypes=["messageAdded"],
@@ -274,7 +328,8 @@ class GmailPushProcessor:
         return list(ids.keys())
 
     def manual_sync(self, max_cycles: Optional[int] = None) -> PollSummary:
-        return self.mail.drain_unprocessed_messages(max_cycles=max_cycles or self.max_sync_cycles)
+        mail = self._ensure_mail()
+        return mail.drain_unprocessed_messages(max_cycles=max_cycles or self.max_sync_cycles)
 
     def read_state(self) -> dict:
         return self.state.read_state()
@@ -305,6 +360,15 @@ def _decode_pubsub_payload(request_body: dict) -> dict:
     return payload
 
 
+def _oauth_unavailable_payload(exc: OAuthTokenInvalidError) -> dict:
+    return {
+        "ok": False,
+        "code": "oauth_unavailable",
+        "reason": exc.reason,
+        "error": str(exc),
+    }
+
+
 def create_app() -> Flask:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = Flask(__name__)
@@ -313,7 +377,10 @@ def create_app() -> Flask:
 
     @app.get("/healthz")
     def healthz():
-        return jsonify({"ok": True}), 200
+        status = processor.health_status()
+        if not status.get("automation_ready", False):
+            LOGGER.error("facturador_health_degraded reason=%s", status.get("reason"))
+        return jsonify(status), 200
 
     @app.post("/pubsub/push")
     def pubsub_push():
@@ -331,6 +398,17 @@ def create_app() -> Flask:
                 LOGGER.info("Push procesado: %s", result)
             finally:
                 operation_lock.release()
+        except OAuthTokenInvalidError as exc:
+            LOGGER.error("Push en modo degradado por OAuth invalido: %s", exc)
+            LOGGER.error("facturador_health_degraded reason=%s source=pubsub_push", exc.reason)
+            return jsonify(
+                {
+                    "ok": True,
+                    "degraded": True,
+                    "reason": exc.reason,
+                    "error": str(exc),
+                }
+            ), 200
         except Exception as exc:
             if is_transient_google_error(exc):
                 LOGGER.warning("Error transitorio procesando push. Se confirma para evitar tormenta de reintentos: %s", exc)
@@ -347,6 +425,10 @@ def create_app() -> Flask:
         try:
             try:
                 result = processor.start_watch()
+            except OAuthTokenInvalidError as exc:
+                LOGGER.error("Watch no disponible por OAuth invalido: %s", exc)
+                LOGGER.error("facturador_health_degraded reason=%s source=admin_start_watch", exc.reason)
+                return jsonify(_oauth_unavailable_payload(exc)), 503
             except Exception as exc:
                 if is_transient_google_error(exc):
                     LOGGER.warning("Error transitorio iniciando watch: %s", exc)
@@ -366,6 +448,10 @@ def create_app() -> Flask:
         try:
             try:
                 summary = processor.manual_sync(max_cycles=max_cycles)
+            except OAuthTokenInvalidError as exc:
+                LOGGER.error("Full-sync no disponible por OAuth invalido: %s", exc)
+                LOGGER.error("facturador_health_degraded reason=%s source=admin_full_sync", exc.reason)
+                return jsonify(_oauth_unavailable_payload(exc)), 503
             except Exception as exc:
                 if is_transient_google_error(exc):
                     LOGGER.warning("Error transitorio en full-sync: %s", exc)

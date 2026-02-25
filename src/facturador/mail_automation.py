@@ -4,6 +4,7 @@ from decimal import Decimal
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -29,6 +30,12 @@ GMAIL_DRIVE_SCOPES = [
 
 class AutomationError(Exception):
     pass
+
+
+class OAuthTokenInvalidError(AutomationError):
+    def __init__(self, message: str, reason: str = "oauth_invalid_grant") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass
@@ -259,6 +266,17 @@ def is_transient_google_error(exc: Exception) -> bool:
     return _is_transient_google_error(exc)
 
 
+def _is_oauth_invalid_grant(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "invalid_grant" in text:
+        return True
+    return "token has been expired or revoked" in text
+
+
+def _is_cloud_runtime() -> bool:
+    return bool(os.getenv("K_SERVICE"))
+
+
 def execute_google_with_retry(action, operation: str, attempts: int = 4, base_delay_sec: float = 1.0):
     last_error = None
     for attempt in range(1, attempts + 1):
@@ -300,13 +318,29 @@ class MailAutomationService:
         Request, Credentials, InstalledAppFlow, build, _ = _import_google_deps()
 
         creds = None
+        force_interactive_reauth = False
         if self.config.token_path.exists():
             creds = Credentials.from_authorized_user_file(str(self.config.token_path), GMAIL_DRIVE_SCOPES)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except Exception as exc:
+                    if _is_oauth_invalid_grant(exc):
+                        if _is_cloud_runtime():
+                            raise OAuthTokenInvalidError(
+                                "Token OAuth de Google expirado o revocado (invalid_grant). "
+                                "Renueva el token en Secret Manager para reactivar el servicio.",
+                            ) from exc
+                        LOGGER.warning(
+                            "Token OAuth invalido (invalid_grant). Se iniciara reautenticacion interactiva local."
+                        )
+                        force_interactive_reauth = True
+                        creds = None
+                    else:
+                        raise
+            if force_interactive_reauth or not creds or not creds.valid:
                 if not self.config.credentials_path.exists():
                     raise FileNotFoundError(
                         "No se encontro credentials de Google OAuth.\n"

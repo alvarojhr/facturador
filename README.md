@@ -82,6 +82,22 @@ Asegura antes:
 - El XLSX conserva formulas entre columnas para recalculo manual.
 - En produccion, `facturador-full-sync` esta configurado 1 vez al dia (`0 2 * * *`, `America/Bogota`).
 
+## Resiliencia OAuth (Cloud Run)
+
+Si el refresh token OAuth expira o es revocado (`invalid_grant`):
+- `GET /healthz` responde `200` con `{"ok": true, "automation_ready": false, "reason": "oauth_invalid_grant"}`.
+- `POST /admin/start-watch` responde `503` con `code=oauth_unavailable`.
+- `POST /admin/full-sync` responde `503` con `code=oauth_unavailable`.
+- `POST /pubsub/push` responde `200` con `degraded=true` para evitar tormenta de reintentos.
+
+Runbook operativo:
+- [oauth_recovery_runbook.md](docs/oauth_recovery_runbook.md)
+
+Configurar metricas y alertas:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\configure_monitoring_alerts.ps1 -ProjectId TU_PROJECT_ID
+```
+
 ## CI/CD (GitHub Actions -> Cloud Run)
 Se agrego el workflow:
 - `.github/workflows/cloud-run-cicd.yml`
