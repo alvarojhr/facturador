@@ -9,11 +9,13 @@ on:
 
 env:
   PYTHON_VERSION: "3.12"
-  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'project-98c83c2b-f615-4eb7-93e' }}
-  GCP_REGION: ${{ vars.GCP_REGION || 'us-central1' }}
-  GCP_SERVICE: ${{ vars.GCP_SERVICE || 'facturador-gmail-trigger' }}
-  GCP_ARTIFACT_REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY || 'cloud-run-source-deploy' }}
-  GCP_IMAGE_NAME: ${{ vars.GCP_IMAGE_NAME || 'facturador-gmail-trigger' }}
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  GCP_SERVICE: ${{ vars.GCP_SERVICE }}
+  GCP_ARTIFACT_REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
+  GCP_IMAGE_NAME: ${{ vars.GCP_IMAGE_NAME }}
+  GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+  GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
 jobs:
   validate:
@@ -49,11 +51,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate required vars
+        run: |
+          required=(
+            GCP_PROJECT_ID
+            GCP_REGION
+            GCP_SERVICE
+            GCP_ARTIFACT_REPOSITORY
+            GCP_IMAGE_NAME
+            GCP_WIF_PROVIDER
+            GCP_DEPLOY_SERVICE_ACCOUNT
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "Missing repository variable: $name"
+              exit 1
+            fi
+          done
+
       - name: Authenticate to Google Cloud (WIF)
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
@@ -71,11 +91,13 @@ jobs:
       - name: Deploy revision
         run: |
           gcloud run services update "${{ env.GCP_SERVICE }}" \
+            --project "${{ env.GCP_PROJECT_ID }}" \
             --region "${{ env.GCP_REGION }}" \
             --image "${IMAGE}"
 
       - name: Show active revision
         run: |
           gcloud run services describe "${{ env.GCP_SERVICE }}" \
+            --project "${{ env.GCP_PROJECT_ID }}" \
             --region "${{ env.GCP_REGION }}" \
             --format="value(status.latestReadyRevisionName,status.url)"

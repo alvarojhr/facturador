@@ -107,19 +107,17 @@ Comportamiento:
 - `push` a `main`: valida + build de imagen + deploy a Cloud Run.
 - `workflow_dispatch`: deploy manual bajo demanda.
 
-### Secrets requeridos en GitHub
-En `Settings > Secrets and variables > Actions`, crea:
-- `GCP_WIF_PROVIDER`
-- `GCP_DEPLOY_SERVICE_ACCOUNT`
-
-Valores configurados para este proyecto:
-- `GCP_WIF_PROVIDER=projects/810301469982/locations/global/workloadIdentityPools/github-pool/providers/github-provider`
-- `GCP_DEPLOY_SERVICE_ACCOUNT=facturador-github-deploy-sa@project-98c83c2b-f615-4eb7-93e.iam.gserviceaccount.com`
-
-### Variables opcionales de Actions
-Puedes sobreescribir defaults con variables del repo:
+### Variables requeridas de Actions
+En `Settings > Secrets and variables > Actions`, configura estas variables del repo:
 - `GCP_PROJECT_ID`
 - `GCP_REGION`
 - `GCP_SERVICE`
 - `GCP_ARTIFACT_REPOSITORY`
 - `GCP_IMAGE_NAME`
+- `GCP_WIF_PROVIDER`
+- `GCP_DEPLOY_SERVICE_ACCOUNT`
+
+Valores esperados para el entorno preprod:
+- `GCP_PROJECT_ID=facturador-preprod`
+- `GCP_REGION=us-central1`
+- `GCP_SERVICE=facturador-gmail-trigger`
