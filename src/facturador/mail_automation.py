@@ -899,7 +899,8 @@ class MailAutomationService:
     def _get_storage_client(self):
         if self._storage_client is None:
             storage = _import_google_storage_dep()
-            self._storage_client = storage.Client(credentials=self.google_credentials)
+            # GCS debe autenticarse con ADC/service account del runtime, no con el token OAuth de Gmail.
+            self._storage_client = storage.Client()
         return self._storage_client
 
     def _upload_invoice_artifacts_to_gcs(self, message_id: str, result: ProcessResult) -> dict:
