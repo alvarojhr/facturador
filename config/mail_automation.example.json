@@ -18,5 +18,9 @@
   "markup_below": "0.68",
   "markup_above": "1.32",
   "round_net_step": "100",
-  "rounding_mode": "up"
+  "rounding_mode": "up",
+  "erp_base_url": "http://localhost:3000",
+  "erp_api_key": "",
+  "artifacts_bucket_name": "",
+  "artifacts_prefix": "facturador-artifacts"
 }

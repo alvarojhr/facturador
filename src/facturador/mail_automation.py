@@ -1,5 +1,6 @@
 import base64
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from decimal import Decimal
 import io
 import json
@@ -9,15 +10,18 @@ from pathlib import Path
 import socket
 import ssl
 import sys
+import threading
 import time
 from typing import Optional
+import urllib.error
+import urllib.request
 import zipfile
 
 from googleapiclient.errors import HttpError
 
 from .invoice_parser import extract_invoice_root_from_bytes, parse_invoice_header
 from .pricing import MarkupConfig
-from .processor import ProcessResult, process_invoice
+from .processor import ProcessResult, process_invoice_bytes
 
 
 LOGGER = logging.getLogger(__name__)
@@ -44,7 +48,7 @@ class MailAutomationConfig:
     processed_label_name: str = "facturador-procesado"
     mark_as_read: bool = True
     poll_interval_sec: int = 60
-    max_messages_per_poll: int = 20
+    max_messages_per_poll: Optional[int] = 20
     drive_parent_folder_id: str = ""
     credentials_path: Path = Path("config/google_credentials.json")
     token_path: Path = Path("config/google_token.json")
@@ -60,6 +64,10 @@ class MailAutomationConfig:
     markup_above: Decimal = Decimal("1.32")
     round_net_step: Decimal = Decimal("100")
     rounding_mode: str = "up"
+    erp_base_url: str = ""
+    erp_api_key: str = ""
+    artifacts_bucket_name: str = ""
+    artifacts_prefix: str = "facturador-artifacts"
 
     def pricing_config(self) -> MarkupConfig:
         return MarkupConfig(
@@ -78,6 +86,63 @@ class PollSummary:
     processed_attachments: int = 0
     failed_messages: int = 0
     skipped_messages: int = 0
+    bytes_processed: int = 0
+    gmail_list_ms: float = 0.0
+    gmail_download_ms: float = 0.0
+    parse_ms: float = 0.0
+    pricing_ms: float = 0.0
+    erp_ms: float = 0.0
+    label_ms: float = 0.0
+    drive_ms: float = 0.0
+    gcs_ms: float = 0.0
+    artifact_ms: float = 0.0
+
+    def merge(self, other: "PollSummary") -> None:
+        self.checked_messages += other.checked_messages
+        self.processed_messages += other.processed_messages
+        self.processed_attachments += other.processed_attachments
+        self.failed_messages += other.failed_messages
+        self.skipped_messages += other.skipped_messages
+        self.bytes_processed += other.bytes_processed
+        self.gmail_list_ms += other.gmail_list_ms
+        self.gmail_download_ms += other.gmail_download_ms
+        self.parse_ms += other.parse_ms
+        self.pricing_ms += other.pricing_ms
+        self.erp_ms += other.erp_ms
+        self.label_ms += other.label_ms
+        self.drive_ms += other.drive_ms
+        self.gcs_ms += other.gcs_ms
+        self.artifact_ms += other.artifact_ms
+
+
+@dataclass(frozen=True)
+class RuntimeOptions:
+    skip_drive: bool = False
+    skip_ingresado_sync: bool = False
+    concurrency: int = 1
+
+
+@dataclass
+class DownloadedMessage:
+    message_id: str
+    subject: str
+    attachments: list[tuple[str, bytes]]
+    download_ms: float
+    bytes_processed: int
+
+
+@dataclass
+class AttachmentSyncMetrics:
+    drive_ms: float = 0.0
+    erp_ms: float = 0.0
+    gcs_ms: float = 0.0
+
+
+@dataclass
+class MessageProcessingOutcome:
+    message_id: str
+    should_mark_processed: bool
+    summary: PollSummary = field(default_factory=PollSummary)
 
 
 def _app_base_dir() -> Path:
@@ -100,6 +165,21 @@ def _resolve_optional_path(base: Path, raw_value: Optional[str]) -> Optional[Pat
 
 def default_mail_automation_config_path() -> Path:
     return _app_base_dir() / "config" / "mail_automation.json"
+
+
+def _parse_optional_positive_int(value, field_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        value = text
+
+    parsed = int(value)
+    if parsed < 1:
+        raise AutomationError(f"{field_name} debe ser >= 1.")
+    return parsed
 
 
 def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationConfig:
@@ -127,7 +207,10 @@ def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationCo
     )
     cfg.mark_as_read = bool(payload.get("mark_as_read", cfg.mark_as_read))
     cfg.poll_interval_sec = int(payload.get("poll_interval_sec", cfg.poll_interval_sec))
-    cfg.max_messages_per_poll = int(payload.get("max_messages_per_poll", cfg.max_messages_per_poll))
+    cfg.max_messages_per_poll = _parse_optional_positive_int(
+        payload.get("max_messages_per_poll", cfg.max_messages_per_poll),
+        "max_messages_per_poll",
+    )
     cfg.drive_parent_folder_id = str(payload.get("drive_parent_folder_id", "")).strip()
 
     credentials = _resolve_optional_path(base, payload.get("credentials_path"))
@@ -154,13 +237,13 @@ def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationCo
     cfg.markup_above = Decimal(str(payload.get("markup_above", cfg.markup_above)))
     cfg.round_net_step = Decimal(str(payload.get("round_net_step", cfg.round_net_step)))
     cfg.rounding_mode = str(payload.get("rounding_mode", cfg.rounding_mode)).strip() or cfg.rounding_mode
+    cfg.erp_base_url = str(payload.get("erp_base_url", cfg.erp_base_url)).strip()
+    cfg.erp_api_key = str(payload.get("erp_api_key", cfg.erp_api_key)).strip()
+    cfg.artifacts_bucket_name = str(payload.get("artifacts_bucket_name", cfg.artifacts_bucket_name)).strip()
+    cfg.artifacts_prefix = str(payload.get("artifacts_prefix", cfg.artifacts_prefix)).strip() or cfg.artifacts_prefix
 
     if cfg.poll_interval_sec < 10:
         raise AutomationError("poll_interval_sec debe ser >= 10 segundos.")
-    if cfg.max_messages_per_poll < 1:
-        raise AutomationError("max_messages_per_poll debe ser >= 1.")
-    if not cfg.drive_parent_folder_id:
-        raise AutomationError("Configura drive_parent_folder_id con el ID de la carpeta destino en Google Drive.")
     if cfg.sync_entered_label:
         if not cfg.entered_label_name:
             raise AutomationError("entered_label_name no puede ser vacio cuando sync_entered_label=true.")
@@ -187,6 +270,17 @@ def _import_google_deps():
             "Ejecuta: pip install -r requirements.txt"
         ) from exc
     return Request, Credentials, InstalledAppFlow, build, MediaFileUpload
+
+
+def _import_google_storage_dep():
+    try:
+        from google.cloud import storage
+    except ImportError as exc:
+        raise AutomationError(
+            "Falta dependencia de Google Cloud Storage.\n"
+            "Ejecuta: pip install -r requirements.txt"
+        ) from exc
+    return storage
 
 
 def _safe_name(value: str) -> str:
@@ -306,7 +400,11 @@ class MailAutomationService:
         self.config.local_work_dir.mkdir(parents=True, exist_ok=True)
         (self.config.local_work_dir / "incoming").mkdir(parents=True, exist_ok=True)
         (self.config.local_work_dir / "output").mkdir(parents=True, exist_ok=True)
-        self.gmail, self.drive = self._build_google_services()
+        self.gmail, self.drive, self.google_credentials = self._build_google_services()
+        self._storage_client = None
+        self._drive_lock = threading.RLock()
+        self._drive_folder_cache: dict[tuple[str, str], str] = {}
+        self._drive_folder_files_cache: dict[str, set[str]] = {}
         self.processed_label_id = self._ensure_gmail_label(self.config.processed_label_name)
         self.entered_label_id: Optional[str] = None
         self.entered_synced_label_id: Optional[str] = None
@@ -361,7 +459,7 @@ class MailAutomationService:
 
         gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-        return gmail, drive
+        return gmail, drive, creds
 
     def _ensure_gmail_label(self, label_name: str) -> str:
         labels_resp = execute_google_with_retry(
@@ -386,46 +484,89 @@ class MailAutomationService:
         )
         return str(created["id"])
 
+    def _resolve_runtime_options(self, runtime: Optional[RuntimeOptions] = None) -> RuntimeOptions:
+        if runtime is None:
+            return RuntimeOptions()
+
+        concurrency = runtime.concurrency if runtime.concurrency > 0 else 1
+        skip_drive = runtime.skip_drive
+        skip_ingresado_sync = runtime.skip_ingresado_sync or skip_drive
+        return RuntimeOptions(
+            skip_drive=skip_drive,
+            skip_ingresado_sync=skip_ingresado_sync,
+            concurrency=concurrency,
+        )
+
+    def _validate_runtime_options(self, runtime: RuntimeOptions) -> None:
+        if runtime.skip_drive and not self.config.erp_base_url:
+            raise AutomationError("skip_drive requiere erp_base_url configurado.")
+        if not runtime.skip_drive and not self.config.drive_parent_folder_id:
+            raise AutomationError("Configura drive_parent_folder_id para ejecutar con Google Drive.")
+        if not runtime.skip_ingresado_sync and self.config.sync_entered_label and not self.config.drive_parent_folder_id:
+            raise AutomationError("Configura drive_parent_folder_id para sincronizar el label 'Ingresado'.")
+
     def run_forever(self) -> None:
         LOGGER.info("Automatizacion Gmail/Drive iniciada. Intervalo: %ss", self.config.poll_interval_sec)
         while True:
             try:
-                summary = self.run_once()
+                summary = self.run_once(runtime=RuntimeOptions())
                 LOGGER.info(
-                    "Ciclo completado. mensajes=%s procesados=%s adjuntos=%s fallidos=%s",
+                    "Ciclo completado. mensajes=%s procesados=%s adjuntos=%s fallidos=%s bytes=%s",
                     summary.checked_messages,
                     summary.processed_messages,
                     summary.processed_attachments,
                     summary.failed_messages,
+                    summary.bytes_processed,
                 )
             except Exception as exc:
                 LOGGER.exception("Fallo en ciclo de automatizacion: %s", exc)
             time.sleep(self.config.poll_interval_sec)
 
-    def run_once(self) -> PollSummary:
+    def run_once(self, runtime: Optional[RuntimeOptions] = None) -> PollSummary:
+        runtime_options = self._resolve_runtime_options(runtime)
+        self._validate_runtime_options(runtime_options)
+
         summary = PollSummary()
+        list_started = time.perf_counter()
         messages = self.query_unprocessed_messages(limit=self.config.max_messages_per_poll)
+        summary.gmail_list_ms = (time.perf_counter() - list_started) * 1000
         summary.checked_messages = len(messages)
 
         if not messages:
-            if self.config.sync_entered_label:
+            if self.config.sync_entered_label and not runtime_options.skip_ingresado_sync:
                 self.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
             return summary
 
-        for msg_ref in messages:
-            msg_id = str(msg_ref.get("id"))
-            if not msg_id:
-                continue
+        if runtime_options.concurrency <= 1 or len(messages) <= 1:
+            for msg_ref in messages:
+                msg_id = str(msg_ref.get("id"))
+                if not msg_id:
+                    continue
+                message = self._download_message(message_id=msg_id, operation="gmail.messages.get")
+                outcome = self._process_downloaded_message(message, runtime_options)
+                summary.merge(outcome.summary)
+                if outcome.should_mark_processed:
+                    summary.label_ms += self._mark_message_processed(message.message_id)
+        else:
+            downloaded_messages: list[DownloadedMessage] = []
+            for msg_ref in messages:
+                msg_id = str(msg_ref.get("id"))
+                if not msg_id:
+                    continue
+                downloaded_messages.append(self._download_message(message_id=msg_id, operation="gmail.messages.get"))
 
-            ok_count, skip_count, failed = self._process_message(msg_id)
-            summary.processed_attachments += ok_count
-            summary.skipped_messages += skip_count
-            if failed:
-                summary.failed_messages += 1
-            else:
-                summary.processed_messages += 1
+            with ThreadPoolExecutor(max_workers=min(runtime_options.concurrency, len(downloaded_messages))) as executor:
+                futures = {
+                    executor.submit(self._process_downloaded_message, message, runtime_options): message.message_id
+                    for message in downloaded_messages
+                }
+                for future in as_completed(futures):
+                    outcome = future.result()
+                    summary.merge(outcome.summary)
+                    if outcome.should_mark_processed:
+                        summary.label_ms += self._mark_message_processed(outcome.message_id)
 
-        if self.config.sync_entered_label:
+        if self.config.sync_entered_label and not runtime_options.skip_ingresado_sync:
             self.sync_ingresado_messages(limit=self.config.max_messages_per_poll)
 
         return summary
@@ -433,15 +574,7 @@ class MailAutomationService:
     def query_unprocessed_messages(self, limit: Optional[int] = None) -> list[dict]:
         processed_query = _gmail_label_query(self.config.processed_label_name)
         query = f"({self.config.gmail_query}) -{processed_query}"
-        listed = execute_google_with_retry(
-            lambda: self.gmail.users().messages().list(
-                userId="me",
-                q=query,
-                maxResults=limit or self.config.max_messages_per_poll,
-            ).execute(),
-            operation="gmail.messages.list",
-        )
-        return listed.get("messages", [])
+        return self._list_messages(query=query, limit=limit, operation="gmail.messages.list")
 
     def query_ingresado_pending_messages(self, limit: Optional[int] = None) -> list[dict]:
         if not self.config.sync_entered_label:
@@ -453,15 +586,7 @@ class MailAutomationService:
             f"-{_gmail_label_query(self.config.entered_synced_label_name)} "
             "has:attachment filename:zip"
         )
-        listed = execute_google_with_retry(
-            lambda: self.gmail.users().messages().list(
-                userId="me",
-                q=query,
-                maxResults=limit or self.config.max_messages_per_poll,
-            ).execute(),
-            operation="gmail.messages.list.ingresado",
-        )
-        return listed.get("messages", [])
+        return self._list_messages(query=query, limit=limit, operation="gmail.messages.list.ingresado")
 
     def sync_ingresado_messages(self, limit: Optional[int] = None) -> int:
         if not self.config.sync_entered_label:
@@ -488,60 +613,150 @@ class MailAutomationService:
             )
         return moved_folders
 
-    def process_message_by_id(self, message_id: str) -> tuple[int, int, bool]:
-        return self._process_message(message_id)
+    def process_message_by_id(self, message_id: str, runtime: Optional[RuntimeOptions] = None) -> tuple[int, int, bool]:
+        runtime_options = self._resolve_runtime_options(runtime)
+        self._validate_runtime_options(runtime_options)
+        message = self._download_message(message_id=message_id, operation="gmail.messages.get.by_id")
+        outcome = self._process_downloaded_message(message, runtime_options)
+        if outcome.should_mark_processed:
+            outcome.summary.label_ms += self._mark_message_processed(message_id)
+        return (
+            outcome.summary.processed_attachments,
+            outcome.summary.skipped_messages,
+            outcome.summary.failed_messages > 0,
+        )
 
-    def drain_unprocessed_messages(self, max_cycles: int = 20) -> PollSummary:
+    def drain_unprocessed_messages(
+        self,
+        max_cycles: int = 20,
+        runtime: Optional[RuntimeOptions] = None,
+    ) -> PollSummary:
         merged = PollSummary()
         for _ in range(max_cycles):
-            cycle = self.run_once()
-            merged.checked_messages += cycle.checked_messages
-            merged.processed_messages += cycle.processed_messages
-            merged.processed_attachments += cycle.processed_attachments
-            merged.failed_messages += cycle.failed_messages
-            merged.skipped_messages += cycle.skipped_messages
+            cycle = self.run_once(runtime=runtime)
+            merged.merge(cycle)
             if cycle.checked_messages == 0:
                 break
         return merged
 
-    def _process_message(self, message_id: str) -> tuple[int, int, bool]:
+    def _list_messages(self, query: str, operation: str, limit: Optional[int] = None) -> list[dict]:
+        resolved_limit = self.config.max_messages_per_poll if limit is None else limit
+        messages: list[dict] = []
+        page_token: Optional[str] = None
+        remaining = resolved_limit
+
+        while True:
+            request_kwargs = {
+                "userId": "me",
+                "q": query,
+            }
+            if page_token:
+                request_kwargs["pageToken"] = page_token
+            if remaining is None:
+                request_kwargs["maxResults"] = 500
+            else:
+                request_kwargs["maxResults"] = min(remaining, 500)
+
+            listed = execute_google_with_retry(
+                lambda request_kwargs=request_kwargs: self.gmail.users().messages().list(**request_kwargs).execute(),
+                operation=operation,
+            )
+            batch = listed.get("messages", [])
+            messages.extend(batch)
+
+            if remaining is not None:
+                remaining -= len(batch)
+                if remaining <= 0:
+                    return messages[:resolved_limit]
+
+            page_token = listed.get("nextPageToken")
+            if not page_token:
+                return messages
+
+    def _download_message(self, message_id: str, operation: str) -> DownloadedMessage:
+        started = time.perf_counter()
         message = execute_google_with_retry(
             lambda: self.gmail.users().messages().get(userId="me", id=message_id, format="full").execute(),
-            operation="gmail.messages.get",
+            operation=operation,
         )
         subject = _message_subject(message)
         zip_attachments = self._extract_zip_attachments(message_id, message)
-        if not zip_attachments:
-            LOGGER.info("Mensaje sin ZIP valido. id=%s subject=%s", message_id, subject)
-            self._mark_message_processed(message_id)
-            return 0, 1, False
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        return DownloadedMessage(
+            message_id=message_id,
+            subject=subject,
+            attachments=zip_attachments,
+            download_ms=elapsed_ms,
+            bytes_processed=sum(len(raw_data) for _, raw_data in zip_attachments),
+        )
+
+    def _process_downloaded_message(
+        self,
+        message: DownloadedMessage,
+        runtime: RuntimeOptions,
+    ) -> MessageProcessingOutcome:
+        summary = PollSummary(
+            gmail_download_ms=message.download_ms,
+            bytes_processed=message.bytes_processed,
+        )
+        if not message.attachments:
+            LOGGER.info("Mensaje sin ZIP valido. id=%s subject=%s", message.message_id, message.subject)
+            summary.skipped_messages = 1
+            return MessageProcessingOutcome(
+                message_id=message.message_id,
+                should_mark_processed=True,
+                summary=summary,
+            )
 
         ok_count = 0
         failed = False
-        for att_name, raw_data in zip_attachments:
+        for attachment_name, raw_data in message.attachments:
             try:
-                self._process_zip_attachment(message_id, att_name, raw_data)
+                result, sync_metrics = self._process_zip_attachment(
+                    message_id=message.message_id,
+                    attachment_name=attachment_name,
+                    data=raw_data,
+                    runtime=runtime,
+                )
                 ok_count += 1
+                summary.processed_attachments += 1
+                summary.parse_ms += result.metrics.parse_ms
+                summary.pricing_ms += result.metrics.pricing_ms
+                summary.artifact_ms += result.metrics.artifact_ms
+                summary.drive_ms += sync_metrics.drive_ms
+                summary.erp_ms += sync_metrics.erp_ms
+                summary.gcs_ms += sync_metrics.gcs_ms
             except Exception as exc:
                 if _is_skippable_attachment_error(exc):
                     LOGGER.warning(
                         "Adjunto ZIP omitido por tipo no soportado. message_id=%s attachment=%s detalle=%s",
-                        message_id,
-                        att_name,
+                        message.message_id,
+                        attachment_name,
                         exc,
                     )
                     continue
                 failed = True
                 LOGGER.exception(
                     "No se pudo procesar adjunto ZIP. message_id=%s attachment=%s error=%s",
-                    message_id,
-                    att_name,
+                    message.message_id,
+                    attachment_name,
                     exc,
                 )
 
-        if not failed:
-            self._mark_message_processed(message_id)
-        return ok_count, 0, failed
+        if failed:
+            summary.failed_messages = 1
+            return MessageProcessingOutcome(
+                message_id=message.message_id,
+                should_mark_processed=False,
+                summary=summary,
+            )
+
+        summary.processed_messages = 1
+        return MessageProcessingOutcome(
+            message_id=message.message_id,
+            should_mark_processed=True,
+            summary=summary,
+        )
 
     def _extract_zip_attachments(self, message_id: str, message_payload: dict) -> list[tuple[str, bytes]]:
         attachments: list[tuple[str, bytes]] = []
@@ -594,11 +809,8 @@ class MailAutomationService:
         return _safe_name(Path(fallback_name).stem)
 
     def _sync_ingresado_message(self, message_id: str) -> int:
-        message = execute_google_with_retry(
-            lambda: self.gmail.users().messages().get(userId="me", id=message_id, format="full").execute(),
-            operation="gmail.messages.get.ingresado",
-        )
-        zip_attachments = self._extract_zip_attachments(message_id, message)
+        downloaded = self._download_message(message_id=message_id, operation="gmail.messages.get.ingresado")
+        zip_attachments = downloaded.attachments
         if not zip_attachments:
             LOGGER.info("Mensaje 'Ingresado' sin adjuntos ZIP. id=%s", message_id)
             return 0
@@ -614,38 +826,221 @@ class MailAutomationService:
                 moved += 1
         return moved
 
-    def _process_zip_attachment(self, message_id: str, attachment_name: str, data: bytes) -> ProcessResult:
-        incoming_dir = self.config.local_work_dir / "incoming"
-        zip_path = incoming_dir / f"{message_id}_{_safe_name(attachment_name)}"
-        with open(zip_path, "wb") as handle:
-            handle.write(data)
-
+    def _process_zip_attachment(
+        self,
+        message_id: str,
+        attachment_name: str,
+        data: bytes,
+        runtime: RuntimeOptions,
+    ) -> tuple[ProcessResult, AttachmentSyncMetrics]:
         output_base = self.config.local_work_dir / "output"
-        result = process_invoice(
-            zip_path,
-            output_base,
-            self.config.pricing_config(),
+        result = process_invoice_bytes(
+            input_name=attachment_name,
+            input_bytes=data,
+            output_path=output_base if not runtime.skip_drive else None,
+            config=self.config.pricing_config(),
             sheet_name=self.config.sheet_name,
             rules_path=self.config.rules_path,
+            generate_output=not runtime.skip_drive,
         )
-        self._sync_folder_to_drive(result.output_path)
+
+        sync_metrics = AttachmentSyncMetrics()
+        if not runtime.skip_drive and result.output_path is not None:
+            drive_started = time.perf_counter()
+            self._sync_folder_to_drive(result.output_path)
+            sync_metrics.drive_ms = (time.perf_counter() - drive_started) * 1000
+
+        erp_ms, gcs_ms = self._post_to_erp(result=result, message_id=message_id)
+        sync_metrics.erp_ms = erp_ms
+        sync_metrics.gcs_ms = gcs_ms
+        return result, sync_metrics
+
+    def _build_erp_payload(self, result: ProcessResult) -> dict:
+        if not result.header:
+            raise AutomationError("Resultado de factura sin header para ERP.")
+
+        header = result.header
+        lines = []
+        if result.price_rows:
+            for i, price_row in enumerate(result.price_rows, 1):
+                discount_factor = Decimal("1") - (price_row.discount_percent / Decimal("100"))
+                unit_cost_after_discount = price_row.cost_bruto_unit * discount_factor
+                line_total = price_row.cost_neto_unit * price_row.quantity
+                lines.append({
+                    "lineNumber": i,
+                    "description": price_row.product,
+                    "quantity": float(price_row.quantity),
+                    "unitCostBeforeDiscount": int(round(price_row.cost_bruto_unit)),
+                    "discountPercent": float(price_row.discount_percent),
+                    "unitCostAfterDiscount": int(round(unit_cost_after_discount)),
+                    "taxPercent": float(price_row.tax_percent),
+                    "unitCostIncTax": int(round(price_row.cost_neto_unit)),
+                    "lineTotal": int(round(line_total)),
+                    "suggestedPriceIncTax": int(round(price_row.venta_neta_unit)),
+                })
+
+        return {
+            "supplier": {
+                "nit": header.supplier_id or "",
+                "name": header.supplier_name or "",
+            },
+            "invoice": {
+                "invoiceNumber": header.invoice_id or "",
+                "cufe": header.cufe or "",
+                "issueDate": header.issue_date or "",
+                "dueDate": header.due_date or "",
+                "subtotal": int(round(header.subtotal)),
+                "taxTotal": int(round(header.tax_total)),
+                "total": int(round(header.total)),
+            },
+            "lines": lines,
+        }
+
+    def _get_storage_client(self):
+        if self._storage_client is None:
+            storage = _import_google_storage_dep()
+            self._storage_client = storage.Client(credentials=self.google_credentials)
+        return self._storage_client
+
+    def _upload_invoice_artifacts_to_gcs(self, message_id: str, result: ProcessResult) -> dict:
+        if not self.config.artifacts_bucket_name:
+            return {}
+
+        storage_client = self._get_storage_client()
+        bucket = storage_client.bucket(self.config.artifacts_bucket_name)
+        invoice_ref = _safe_name(result.invoice_ref or "Factura")
+        message_ref = _safe_name(message_id)
+        prefix_parts = [self.config.artifacts_prefix.strip("/"), invoice_ref, message_ref]
+        base_prefix = "/".join(part for part in prefix_parts if part)
+
+        artifacts: dict[str, str] = {}
+        if result.raw_xml:
+            xml_name = f"{base_prefix}/{invoice_ref}.xml"
+            bucket.blob(xml_name).upload_from_string(
+                result.raw_xml.encode("utf-8"),
+                content_type="application/xml; charset=utf-8",
+            )
+            artifacts["xmlGcsUri"] = f"gs://{bucket.name}/{xml_name}"
+
+        if result.pdf_bytes:
+            pdf_name = _safe_name(result.pdf_filename or f"{invoice_ref}.pdf")
+            pdf_object = f"{base_prefix}/{pdf_name}"
+            bucket.blob(pdf_object).upload_from_string(result.pdf_bytes, content_type="application/pdf")
+            artifacts["pdfGcsUri"] = f"gs://{bucket.name}/{pdf_object}"
+            artifacts["pdfFilename"] = result.pdf_filename or pdf_name
+
+        return artifacts
+
+    def _post_to_erp(self, result: ProcessResult, message_id: str) -> tuple[float, float]:
+        if not self.config.erp_base_url or not result.header:
+            return 0.0, 0.0
+
+        payload = self._build_erp_payload(result)
+        gcs_ms = 0.0
+        artifacts = {}
+        if self.config.artifacts_bucket_name:
+            gcs_started = time.perf_counter()
+            artifacts = self._upload_invoice_artifacts_to_gcs(message_id=message_id, result=result)
+            gcs_ms = (time.perf_counter() - gcs_started) * 1000
+            if artifacts:
+                payload["artifacts"] = artifacts
+
+        if not artifacts:
+            if result.pdf_bytes:
+                payload["pdfBase64"] = base64.b64encode(result.pdf_bytes).decode("ascii")
+                payload["pdfFilename"] = result.pdf_filename or "invoice.pdf"
+            if result.raw_xml:
+                payload["xmlRaw"] = result.raw_xml
+
+        url = f"{self.config.erp_base_url.rstrip('/')}/api/purchases/ingest"
+        req_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=req_data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if self.config.erp_api_key:
+            req.add_header("X-API-Key", self.config.erp_api_key)
+
+        started = time.perf_counter()
         try:
-            zip_path.unlink(missing_ok=True)
-        except Exception:
-            LOGGER.warning("No se pudo eliminar temporal ZIP: %s", zip_path)
-        return result
+            with urllib.request.urlopen(req, timeout=60) as response:
+                status = response.status
+                body = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            raise AutomationError(
+                f"ERP devolvio HTTP {exc.code} para invoice={result.header.invoice_id or '?'} body={body}"
+            ) from exc
+        except Exception as exc:
+            raise AutomationError(
+                f"ERP ingestion failed para invoice={result.header.invoice_id or '?'}: {exc}"
+            ) from exc
+
+        erp_ms = (time.perf_counter() - started) * 1000
+        LOGGER.info(
+            "ERP ingestion OK: invoice=%s status=%s response=%s",
+            result.header.invoice_id,
+            status,
+            body[:500],
+        )
+        return erp_ms, gcs_ms
 
     def _sync_folder_to_drive(self, local_folder: Path) -> None:
         if not local_folder.exists() or not local_folder.is_dir():
             raise AutomationError(f"Carpeta local invalida para subida: {local_folder}")
 
-        folder_id = self._ensure_drive_folder(local_folder.name, self.config.drive_parent_folder_id)
-        for item in local_folder.iterdir():
-            if not item.is_file():
-                continue
-            self._upload_file_if_missing(item, folder_id)
+        with self._drive_lock:
+            folder_id = self._ensure_drive_folder(local_folder.name, self.config.drive_parent_folder_id)
+            for item in local_folder.iterdir():
+                if not item.is_file():
+                    continue
+                self._upload_file_if_missing(item, folder_id)
+
+    def _cache_drive_folder(self, folder_name: str, parent_id: str, folder_id: str) -> str:
+        self._drive_folder_cache[(parent_id, folder_name)] = folder_id
+        return folder_id
+
+    def _list_drive_folder_file_names(self, drive_folder_id: str) -> set[str]:
+        cached = self._drive_folder_files_cache.get(drive_folder_id)
+        if cached is not None:
+            return cached
+
+        names: set[str] = set()
+        page_token: Optional[str] = None
+        escaped_parent = _escape_drive_query_value(drive_folder_id)
+        query = f"'{escaped_parent}' in parents and trashed=false"
+
+        while True:
+            request_kwargs = {
+                "q": query,
+                "spaces": "drive",
+                "fields": "nextPageToken,files(name)",
+                "pageSize": 200,
+            }
+            if page_token:
+                request_kwargs["pageToken"] = page_token
+
+            listed = execute_google_with_retry(
+                lambda request_kwargs=request_kwargs: self.drive.files().list(**request_kwargs).execute(),
+                operation="drive.files.list.folder_contents",
+            )
+            for file_info in listed.get("files", []):
+                name = str(file_info.get("name") or "").strip()
+                if name:
+                    names.add(name)
+
+            page_token = listed.get("nextPageToken")
+            if not page_token:
+                self._drive_folder_files_cache[drive_folder_id] = names
+                return names
 
     def _find_drive_folder(self, folder_name: str, parent_id: str) -> Optional[str]:
+        cached = self._drive_folder_cache.get((parent_id, folder_name))
+        if cached:
+            return cached
+
         escaped_name = _escape_drive_query_value(folder_name)
         escaped_parent = _escape_drive_query_value(parent_id)
         query = (
@@ -658,7 +1053,7 @@ class MailAutomationService:
         )
         files = listed.get("files", [])
         if files:
-            return str(files[0]["id"])
+            return self._cache_drive_folder(folder_name, parent_id, str(files[0]["id"]))
         return None
 
     def _ensure_drive_folder(self, folder_name: str, parent_id: str) -> str:
@@ -677,50 +1072,49 @@ class MailAutomationService:
             ).execute(),
             operation="drive.files.create.folder",
         )
-        return str(created["id"])
+        folder_id = str(created["id"])
+        self._cache_drive_folder(folder_name, parent_id, folder_id)
+        self._drive_folder_files_cache[folder_id] = set()
+        return folder_id
 
     def _move_drive_folder(self, folder_name: str, target_parent_id: str) -> bool:
-        source_folder_id = self._find_drive_folder(folder_name, self.config.drive_parent_folder_id)
-        if source_folder_id is None:
-            already_target_id = self._find_drive_folder(folder_name, target_parent_id)
-            if already_target_id is not None:
-                LOGGER.info("Carpeta ya ubicada en '%s': %s", self.config.entered_drive_subfolder_name, folder_name)
-            else:
-                LOGGER.warning("No se encontro carpeta en Drive para mover: %s", folder_name)
-            return False
+        with self._drive_lock:
+            source_folder_id = self._find_drive_folder(folder_name, self.config.drive_parent_folder_id)
+            if source_folder_id is None:
+                already_target_id = self._find_drive_folder(folder_name, target_parent_id)
+                if already_target_id is not None:
+                    LOGGER.info("Carpeta ya ubicada en '%s': %s", self.config.entered_drive_subfolder_name, folder_name)
+                else:
+                    LOGGER.warning("No se encontro carpeta en Drive para mover: %s", folder_name)
+                return False
 
-        metadata = execute_google_with_retry(
-            lambda: self.drive.files().get(fileId=source_folder_id, fields="id,name,parents").execute(),
-            operation="drive.files.get.folder_move",
-        )
-        parents = [str(item) for item in metadata.get("parents", []) if item]
-        if target_parent_id in parents and len(parents) == 1:
-            return False
+            metadata = execute_google_with_retry(
+                lambda: self.drive.files().get(fileId=source_folder_id, fields="id,name,parents").execute(),
+                operation="drive.files.get.folder_move",
+            )
+            parents = [str(item) for item in metadata.get("parents", []) if item]
+            if target_parent_id in parents and len(parents) == 1:
+                return False
 
-        remove_parents = ",".join(parent for parent in parents if parent != target_parent_id)
-        execute_google_with_retry(
-            lambda: self.drive.files().update(
-                fileId=source_folder_id,
-                addParents=target_parent_id,
-                removeParents=remove_parents,
-                fields="id,parents",
-            ).execute(),
-            operation="drive.files.update.move_folder",
-        )
-        LOGGER.info("Carpeta movida a '%s': %s", self.config.entered_drive_subfolder_name, folder_name)
-        return True
+            remove_parents = ",".join(parent for parent in parents if parent != target_parent_id)
+            execute_google_with_retry(
+                lambda: self.drive.files().update(
+                    fileId=source_folder_id,
+                    addParents=target_parent_id,
+                    removeParents=remove_parents,
+                    fields="id,parents",
+                ).execute(),
+                operation="drive.files.update.move_folder",
+            )
+            self._drive_folder_cache.pop((self.config.drive_parent_folder_id, folder_name), None)
+            self._cache_drive_folder(folder_name, target_parent_id, source_folder_id)
+            LOGGER.info("Carpeta movida a '%s': %s", self.config.entered_drive_subfolder_name, folder_name)
+            return True
 
     def _upload_file_if_missing(self, local_file: Path, drive_folder_id: str) -> None:
         _, _, _, _, MediaFileUpload = _import_google_deps()
-        escaped_name = _escape_drive_query_value(local_file.name)
-        escaped_parent = _escape_drive_query_value(drive_folder_id)
-        query = f"name='{escaped_name}' and '{escaped_parent}' in parents and trashed=false"
-        listed = execute_google_with_retry(
-            lambda: self.drive.files().list(q=query, spaces="drive", fields="files(id,name)", pageSize=1).execute(),
-            operation="drive.files.list.file",
-        )
-        existing = listed.get("files", [])
-        if existing:
+        existing_file_names = self._list_drive_folder_file_names(drive_folder_id)
+        if local_file.name in existing_file_names:
             LOGGER.info("Archivo ya existe en Drive, se conserva: %s", local_file.name)
             return
 
@@ -736,10 +1130,12 @@ class MailAutomationService:
             ).execute(),
             operation="drive.files.create.file",
         )
+        existing_file_names.add(local_file.name)
         LOGGER.info("Archivo subido a Drive: %s", local_file)
 
-    def _mark_message_processed(self, message_id: str) -> None:
+    def _mark_message_processed(self, message_id: str) -> float:
         remove = ["UNREAD"] if self.config.mark_as_read else []
+        started = time.perf_counter()
         execute_google_with_retry(
             lambda: self.gmail.users().messages().modify(
                 userId="me",
@@ -751,6 +1147,7 @@ class MailAutomationService:
             ).execute(),
             operation="gmail.messages.modify",
         )
+        return (time.perf_counter() - started) * 1000
 
     def _mark_ingresado_synced(self, message_id: str) -> None:
         if not self.entered_synced_label_id:

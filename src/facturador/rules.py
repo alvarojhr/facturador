@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
+from functools import lru_cache
 import re
 
 from openpyxl import load_workbook
@@ -18,9 +19,11 @@ def _normalize_header(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
 
-def load_rules(path: Path) -> List[PricingRule]:
+@lru_cache(maxsize=8)
+def _load_rules_cached(path_str: str, mtime_ns: int) -> tuple[PricingRule, ...]:
+    path = Path(path_str)
     if not path.exists():
-        return []
+        return ()
     wb = load_workbook(path, data_only=True)
     ws = wb.active
 
@@ -46,7 +49,14 @@ def load_rules(path: Path) -> List[PricingRule]:
         if not pattern:
             continue
         rules.append(PricingRule(match_type=match_type, pattern=pattern, utilidad_percent=utilidad))
-    return rules
+    return tuple(rules)
+
+
+def load_rules(path: Path) -> List[PricingRule]:
+    if not path.exists():
+        return []
+    stat = path.stat()
+    return list(_load_rules_cached(str(path.resolve()), stat.st_mtime_ns))
 
 
 def find_rule(description: str, rules: List[PricingRule]) -> Optional[PricingRule]:

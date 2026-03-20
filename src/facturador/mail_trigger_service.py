@@ -17,6 +17,7 @@ from .mail_automation import (
     MailAutomationService,
     OAuthTokenInvalidError,
     PollSummary,
+    RuntimeOptions,
     execute_google_with_retry,
     is_transient_google_error,
     load_mail_automation_config,
@@ -173,6 +174,8 @@ class GmailPushProcessor:
         drive_folder_id = _str_env("FACTURADOR_DRIVE_PARENT_FOLDER_ID")
         local_work_dir = _str_env("FACTURADOR_LOCAL_WORK_DIR")
         rules_path = _str_env("FACTURADOR_RULES_PATH")
+        artifacts_bucket_name = _str_env("FACTURADOR_ARTIFACTS_BUCKET_NAME")
+        artifacts_prefix = _str_env("FACTURADOR_ARTIFACTS_PREFIX")
 
         if credentials_path:
             config.credentials_path = Path(credentials_path)
@@ -184,6 +187,10 @@ class GmailPushProcessor:
             config.local_work_dir = Path(local_work_dir)
         if rules_path:
             config.rules_path = Path(rules_path)
+        if artifacts_bucket_name:
+            config.artifacts_bucket_name = artifacts_bucket_name
+        if artifacts_prefix:
+            config.artifacts_prefix = artifacts_prefix
 
         max_per_poll = _str_env("FACTURADOR_MAX_MESSAGES_PER_POLL")
         if max_per_poll:
@@ -327,9 +334,20 @@ class GmailPushProcessor:
                 break
         return list(ids.keys())
 
-    def manual_sync(self, max_cycles: Optional[int] = None) -> PollSummary:
+    def manual_sync(
+        self,
+        max_cycles: Optional[int] = None,
+        runtime: Optional[RuntimeOptions] = None,
+        max_messages_per_poll: Optional[int] = None,
+    ) -> PollSummary:
         mail = self._ensure_mail()
-        return mail.drain_unprocessed_messages(max_cycles=max_cycles or self.max_sync_cycles)
+        original_max = mail.config.max_messages_per_poll
+        if max_messages_per_poll is not None:
+            mail.config.max_messages_per_poll = max_messages_per_poll
+        try:
+            return mail.drain_unprocessed_messages(max_cycles=max_cycles or self.max_sync_cycles, runtime=runtime)
+        finally:
+            mail.config.max_messages_per_poll = original_max
 
     def read_state(self) -> dict:
         return self.state.read_state()
@@ -443,11 +461,27 @@ def create_app() -> Flask:
     def full_sync():
         _require_admin_token()
         max_cycles = request.args.get("max_cycles", default=None, type=int)
+        skip_drive = request.args.get("skip_drive", default=False, type=lambda value: str(value).lower() in {"1", "true", "yes", "on"})
+        skip_ingresado_sync = request.args.get(
+            "skip_ingresado_sync",
+            default=False,
+            type=lambda value: str(value).lower() in {"1", "true", "yes", "on"},
+        )
+        concurrency = request.args.get("concurrency", default=4, type=int)
+        max_messages_per_poll = request.args.get("max_messages_per_poll", default=None, type=int)
         if not operation_lock.acquire(blocking=False):
             return jsonify({"ok": True, "skipped": "busy"}), 200
         try:
             try:
-                summary = processor.manual_sync(max_cycles=max_cycles)
+                summary = processor.manual_sync(
+                    max_cycles=max_cycles,
+                    runtime=RuntimeOptions(
+                        skip_drive=skip_drive,
+                        skip_ingresado_sync=skip_ingresado_sync,
+                        concurrency=concurrency if concurrency and concurrency > 0 else 4,
+                    ),
+                    max_messages_per_poll=max_messages_per_poll,
+                )
             except OAuthTokenInvalidError as exc:
                 LOGGER.error("Full-sync no disponible por OAuth invalido: %s", exc)
                 LOGGER.error("facturador_health_degraded reason=%s source=admin_full_sync", exc.reason)

@@ -5,6 +5,7 @@ param(
     [string]$ServiceName = "facturador-gmail-trigger",
     [string]$FirestoreLocation = "us-central1",
     [string]$TopicName = "facturador-gmail-updates",
+    [string]$WatchTopicProjectId = "",
     [string]$SubscriptionName = "facturador-gmail-push",
     [string]$SchedulerLocation = "us-central1",
     [string]$WatchRenewJobName = "facturador-watch-renew",
@@ -29,7 +30,12 @@ param(
     [string]$CredentialsSecretName = "facturador-google-credentials",
     [string]$TokenSecretName = "facturador-google-token",
     [string]$AdminTokenSecretName = "facturador-admin-token",
-    [string]$AdminToken = ""
+    [string]$AdminToken = "",
+    [string]$ArtifactsBucketName = "",
+    [string]$ArtifactsBucketLocation = "us-central1",
+    [string]$ArtifactsPrefix = "facturador-artifacts",
+    [string]$ErpProjectId = "ferreteria-pinki-preprod",
+    [string]$ErpServiceName = "ferreteria-pinki"
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +53,15 @@ function Assert-Tool([string]$Name) {
     }
 }
 
+function Get-OAuthProjectId([string]$CredentialsFilePath) {
+    $oauthConfig = Get-Content $CredentialsFilePath -Raw | ConvertFrom-Json
+    $projectId = $oauthConfig.installed.project_id
+    if (-not $projectId) {
+        $projectId = $oauthConfig.web.project_id
+    }
+    return $projectId
+}
+
 function Test-GcloudResource {
     param(
         [Parameter(Mandatory = $true)]
@@ -58,6 +73,12 @@ function Test-GcloudResource {
         return $LASTEXITCODE -eq 0
     } catch {
         return $false
+    }
+}
+
+function Assert-LastExitCode([string]$Operation) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Operation fallo con codigo de salida $LASTEXITCODE."
     }
 }
 
@@ -111,6 +132,17 @@ function Ensure-Subscription(
     }
 }
 
+function Ensure-Bucket([string]$BucketName, [string]$Project, [string]$Location) {
+    if (-not (Test-GcloudResource -Args @("storage", "buckets", "describe", "gs://$BucketName", "--project", $Project))) {
+        gcloud storage buckets create "gs://$BucketName" `
+            --project $Project `
+            --location $Location `
+            --uniform-bucket-level-access `
+            --public-access-prevention | Out-Null
+        Assert-LastExitCode "gcloud storage buckets create gs://$BucketName"
+    }
+}
+
 function Ensure-SchedulerJob(
     [string]$Project,
     [string]$Location,
@@ -133,6 +165,7 @@ function Ensure-SchedulerJob(
             --oidc-service-account-email "$ServiceAccount" `
             --oidc-token-audience "$Audience" `
             --headers "X-Facturador-Admin-Token=$HeaderValue" | Out-Null
+        Assert-LastExitCode "gcloud scheduler jobs create http $JobName"
     } else {
         gcloud scheduler jobs update http $JobName `
             --project $Project `
@@ -143,7 +176,8 @@ function Ensure-SchedulerJob(
             --http-method POST `
             --oidc-service-account-email "$ServiceAccount" `
             --oidc-token-audience "$Audience" `
-            --headers "X-Facturador-Admin-Token=$HeaderValue" | Out-Null
+            --update-headers "X-Facturador-Admin-Token=$HeaderValue" | Out-Null
+        Assert-LastExitCode "gcloud scheduler jobs update http $JobName"
     }
 }
 
@@ -171,6 +205,17 @@ if (-not $projectNumber) {
     throw "No se pudo obtener project number de $ProjectId"
 }
 
+if (-not $ArtifactsBucketName) {
+    $ArtifactsBucketName = "$ProjectId-artifacts-$projectNumber"
+}
+
+$oauthProjectId = Get-OAuthProjectId -CredentialsFilePath $CredentialsPath
+$watchTopicProject = if ($WatchTopicProjectId) { $WatchTopicProjectId } elseif ($oauthProjectId) { $oauthProjectId } else { $ProjectId }
+$watchTopicProjectNumber = & $gcloudExe projects describe $watchTopicProject --format "value(projectNumber)"
+if (-not $watchTopicProjectNumber) {
+    throw "No se pudo obtener project number de $watchTopicProject"
+}
+
 gcloud services enable `
     run.googleapis.com `
     cloudbuild.googleapis.com `
@@ -183,6 +228,13 @@ gcloud services enable `
     gmail.googleapis.com `
     --project $ProjectId | Out-Null
 
+if ($watchTopicProject -ne $ProjectId) {
+    gcloud services enable `
+        pubsub.googleapis.com `
+        iam.googleapis.com `
+        --project $watchTopicProject | Out-Null
+}
+
 if (-not (Test-GcloudResource -Args @("firestore", "databases", "describe", "--database=(default)", "--project", $ProjectId))) {
     gcloud firestore databases create `
         --database="(default)" `
@@ -193,7 +245,27 @@ if (-not (Test-GcloudResource -Args @("firestore", "databases", "describe", "--d
 
 $triggerServiceAccount = Ensure-ServiceAccount -Project $ProjectId -Name $TriggerServiceAccountName
 $schedulerServiceAccount = Ensure-ServiceAccount -Project $ProjectId -Name $SchedulerServiceAccountName
-$pubsubPushServiceAccount = Ensure-ServiceAccount -Project $ProjectId -Name $PubSubPushServiceAccountName
+$pubsubPushServiceAccount = Ensure-ServiceAccount -Project $watchTopicProject -Name $PubSubPushServiceAccountName
+
+$erpServiceAccount = gcloud run services describe $ErpServiceName `
+    --project $ErpProjectId `
+    --region $Region `
+    --format "value(spec.template.spec.serviceAccountName)"
+if (-not $erpServiceAccount) {
+    throw "No se pudo resolver service account del ERP $ErpServiceName en $ErpProjectId."
+}
+
+Ensure-Bucket -BucketName $ArtifactsBucketName -Project $ProjectId -Location $ArtifactsBucketLocation
+
+gcloud storage buckets add-iam-policy-binding "gs://$ArtifactsBucketName" `
+    --member "serviceAccount:$triggerServiceAccount" `
+    --role "roles/storage.objectAdmin" | Out-Null
+Assert-LastExitCode "gcloud storage buckets add-iam-policy-binding objectAdmin"
+
+gcloud storage buckets add-iam-policy-binding "gs://$ArtifactsBucketName" `
+    --member "serviceAccount:$erpServiceAccount" `
+    --role "roles/storage.objectViewer" | Out-Null
+Assert-LastExitCode "gcloud storage buckets add-iam-policy-binding objectViewer"
 
 gcloud projects add-iam-policy-binding $ProjectId `
     --member "serviceAccount:$triggerServiceAccount" `
@@ -202,17 +274,19 @@ gcloud projects add-iam-policy-binding $ProjectId `
     --member "serviceAccount:$triggerServiceAccount" `
     --role "roles/datastore.user" | Out-Null
 
-Ensure-Topic -Project $ProjectId -TopicName $TopicName
+Ensure-Topic -Project $watchTopicProject -TopicName $TopicName
 
 if (-not $AdminToken) {
     $AdminToken = [Guid]::NewGuid().ToString("N")
 }
 
 $cloudConfigObj = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-$cloudConfigObj.credentials_path = "/secrets/google_credentials.json"
-$cloudConfigObj.token_path = "/secrets/google_token.json"
+$cloudConfigObj.credentials_path = "/secrets/oauth/google_credentials.json"
+$cloudConfigObj.token_path = "/secrets/token/google_token.json"
 $cloudConfigObj.local_work_dir = "/tmp/facturador"
 $cloudConfigObj.max_messages_per_poll = 100
+$cloudConfigObj.artifacts_bucket_name = $ArtifactsBucketName
+$cloudConfigObj.artifacts_prefix = $ArtifactsPrefix
 $cloudConfigText = $cloudConfigObj | ConvertTo-Json -Depth 12
 $tmpCloudConfig = Join-Path $env:TEMP "facturador_mail_automation_cloud.json"
 [System.IO.File]::WriteAllText($tmpCloudConfig, "$cloudConfigText`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -235,12 +309,13 @@ gcloud run deploy $ServiceName `
     --max-instances 1 `
     --port 8080 `
     --labels "app=facturador,component=mail-trigger,environment=preprod" `
-    --set-env-vars "FACTURADOR_AUTOMATION_CONFIG_PATH=/secrets/config/mail_automation.json,FACTURADOR_CREDENTIALS_PATH=/secrets/oauth/google_credentials.json,FACTURADOR_TOKEN_PATH=/secrets/token/google_token.json,FACTURADOR_STATE_COLLECTION=$StateCollection,FACTURADOR_STATE_DOC=$StateDoc,FACTURADOR_WATCH_TOPIC=projects/$ProjectId/topics/$TopicName,FACTURADOR_WATCH_LABEL_IDS=$WatchLabelIds,FACTURADOR_WATCH_SYNC_AFTER_START=$WatchSyncAfterStart,FACTURADOR_SYNC_MAX_CYCLES=$SyncMaxCycles" `
-    --set-secrets "FACTURADOR_ADMIN_TOKEN=$AdminTokenSecretName:latest" `
-    --set-secrets "/secrets/config/mail_automation.json=$ConfigSecretName:latest" `
-    --set-secrets "/secrets/oauth/google_credentials.json=$CredentialsSecretName:latest" `
-    --set-secrets "/secrets/token/google_token.json=$TokenSecretName:latest" `
+    --set-env-vars "FACTURADOR_AUTOMATION_CONFIG_PATH=/secrets/config/mail_automation.json,FACTURADOR_CREDENTIALS_PATH=/secrets/oauth/google_credentials.json,FACTURADOR_TOKEN_PATH=/secrets/token/google_token.json,FACTURADOR_STATE_COLLECTION=$StateCollection,FACTURADOR_STATE_DOC=$StateDoc,FACTURADOR_WATCH_TOPIC=projects/$watchTopicProject/topics/$TopicName,FACTURADOR_WATCH_LABEL_IDS=$WatchLabelIds,FACTURADOR_WATCH_SYNC_AFTER_START=$WatchSyncAfterStart,FACTURADOR_SYNC_MAX_CYCLES=$SyncMaxCycles" `
+    --set-secrets "FACTURADOR_ADMIN_TOKEN=${AdminTokenSecretName}:latest" `
+    --set-secrets "/secrets/config/mail_automation.json=${ConfigSecretName}:latest" `
+    --set-secrets "/secrets/oauth/google_credentials.json=${CredentialsSecretName}:latest" `
+    --set-secrets "/secrets/token/google_token.json=${TokenSecretName}:latest" `
     --quiet | Out-Null
+Assert-LastExitCode "gcloud run deploy $ServiceName"
 
 $serviceUrl = gcloud run services describe $ServiceName --project $ProjectId --region $Region --format "value(status.url)"
 if (-not $serviceUrl) {
@@ -259,14 +334,14 @@ gcloud run services add-iam-policy-binding $ServiceName `
     --member "serviceAccount:$pubsubPushServiceAccount" `
     --role "roles/run.invoker" | Out-Null
 
-$pubsubServiceAgent = "service-$projectNumber@gcp-sa-pubsub.iam.gserviceaccount.com"
+$pubsubServiceAgent = "service-$watchTopicProjectNumber@gcp-sa-pubsub.iam.gserviceaccount.com"
 gcloud iam service-accounts add-iam-policy-binding $pubsubPushServiceAccount `
-    --project $ProjectId `
+    --project $watchTopicProject `
     --member "serviceAccount:$pubsubServiceAgent" `
     --role "roles/iam.serviceAccountTokenCreator" | Out-Null
 
 Ensure-Subscription `
-    -Project $ProjectId `
+    -Project $watchTopicProject `
     -SubscriptionName $SubscriptionName `
     -TopicName $TopicName `
     -PushEndpoint "$serviceUrl/pubsub/push" `
@@ -289,24 +364,22 @@ Ensure-SchedulerJob `
     -JobName $FullSyncJobName `
     -Schedule $FullSyncSchedule `
     -TimeZone $FullSyncScheduleTimeZone `
-    -Uri "$serviceUrl/admin/full-sync?max_cycles=$FullSyncMaxCycles" `
+    -Uri "$serviceUrl/admin/full-sync?max_cycles=$FullSyncMaxCycles&skip_drive=1&concurrency=4" `
     -ServiceAccount $schedulerServiceAccount `
     -Audience $serviceUrl `
     -HeaderValue $AdminToken
 
-$identityToken = gcloud auth print-identity-token --audiences "$serviceUrl"
-$headers = @{
-    "Authorization" = "Bearer $identityToken"
-    "X-Facturador-Admin-Token" = $AdminToken
-}
-$initialWatch = Invoke-RestMethod -Method Post -Uri "$serviceUrl/admin/start-watch" -Headers $headers
+gcloud scheduler jobs run $WatchRenewJobName `
+    --project $ProjectId `
+    --location $SchedulerLocation | Out-Null
+Assert-LastExitCode "gcloud scheduler jobs run $WatchRenewJobName"
 
 Write-Output "Deployment completado."
 Write-Output "Cloud Run URL: $serviceUrl"
-Write-Output "Pub/Sub topic: projects/$ProjectId/topics/$TopicName"
+Write-Output "Pub/Sub topic: projects/$watchTopicProject/topics/$TopicName"
 Write-Output "Pub/Sub subscription: $SubscriptionName"
 Write-Output "Watch renew job: $WatchRenewJobName"
 Write-Output "Full sync job: $FullSyncJobName"
+Write-Output "Artifacts bucket: gs://$ArtifactsBucketName"
 Write-Output "Admin token usado: $AdminToken"
-Write-Output "Respuesta start-watch inicial:"
-$initialWatch | ConvertTo-Json -Depth 8
+Write-Output "Watch renew inicial disparado via Cloud Scheduler."
