@@ -14,20 +14,26 @@ El refresh token de OAuth (Gmail/Drive) fue revocado o expiro.
 
 ## Recuperacion inmediata
 
+1. Ejecuta la rotacion asistida:
+   - `powershell -ExecutionPolicy Bypass -File .\rotate_google_oauth_token.ps1 -ProjectId <PROJECT_ID>`
+   - Si el refresh token ya no sirve, completa el consentimiento en navegador con la misma cuenta Gmail del negocio.
+2. Verifica en logs:
+   - sin nuevos `invalid_grant`
+   - jobs Scheduler exitosos en siguientes ciclos.
+
+## Recuperacion manual (fallback)
+
 1. Regenera token local:
    - `python run_mail_automation.py --once --verbose`
    - Completa el consentimiento en navegador con la misma cuenta Gmail del negocio.
 2. Verifica que se actualizo `config/google_token.json`.
 3. Sube nueva version del secreto:
    - `gcloud secrets versions add facturador-google-token --data-file config/google_token.json --project <PROJECT_ID>`
-4. Fuerza nueva revision de Cloud Run para recargar secretos:
-   - `gcloud run services update facturador-gmail-trigger --region us-central1 --project <PROJECT_ID> --update-env-vars FACTURADOR_TOKEN_ROTATION_TS=<timestamp>`
+4. Fuerza nueva revision de Cloud Run para recargar secretos y corregir el topic de Gmail:
+   - `gcloud run services update facturador-gmail-trigger --region us-central1 --project <PROJECT_ID> --update-env-vars FACTURADOR_WATCH_TOPIC=projects/<OAUTH_PROJECT_ID>/topics/facturador-gmail-updates,FACTURADOR_TOKEN_ROTATION_TS=<timestamp>`
 5. Ejecuta recuperacion operativa:
-   - `POST /admin/start-watch`
-   - `POST /admin/full-sync?max_cycles=5`
-6. Verifica en logs:
-   - sin nuevos `invalid_grant`
-   - jobs Scheduler exitosos en siguientes ciclos.
+   - `gcloud scheduler jobs run facturador-watch-renew --location us-central1 --project <PROJECT_ID>`
+   - `gcloud scheduler jobs run facturador-full-sync --location us-central1 --project <PROJECT_ID>`
 
 ## Endpoints esperados (modo degradado OAuth)
 

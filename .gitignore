@@ -29,6 +29,7 @@ automation_work/
 config/google_credentials.json
 config/google_token.json
 config/mail_automation.json
+config/local/
 
 # Invoice inputs/outputs kept local
 invoices/*
