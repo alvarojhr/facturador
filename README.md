@@ -36,6 +36,7 @@ Campos clave:
 - `erp_api_key`: API key para ingesta desde Facturador.
 - `artifacts_bucket_name`: bucket GCS opcional para publicar PDF/XML y enviarlos por referencia `gs://` al ERP.
 - `artifacts_prefix`: prefijo dentro del bucket para organizar artefactos por factura.
+- `token_store_project` / `token_store_collection` / `token_store_doc`: store opcional para persistir el refresh token OAuth en Firestore. Recomendado en Cloud Run para no depender de un mount de secretos de solo lectura.
 
 Tambien puedes usar `config/mail_automation.example.json` como plantilla.
 
@@ -99,6 +100,14 @@ Asegura antes:
 
 ## Resiliencia OAuth (Cloud Run)
 
+Para eliminar la rotacion semanal del refresh token no basta con cambiar el almacenamiento:
+- el OAuth consent screen debe estar en estado `In production`;
+- si el proyecto es `External` y queda en `Testing`, Google emite refresh tokens que expiran en 7 dias para scopes como Gmail/Drive.
+
+Persistencia recomendada en nube:
+- `config/google_token.json` en Secret Manager solo como bootstrap inicial;
+- Firestore como store writable del refresh token vigente durante los refresh automáticos.
+
 Si el refresh token OAuth expira o es revocado (`invalid_grant`):
 - `GET /healthz` responde `200` con `{"ok": true, "automation_ready": false, "reason": "oauth_invalid_grant"}`.
 - `POST /admin/start-watch` responde `503` con `code=oauth_unavailable`.
@@ -120,6 +129,8 @@ Rotacion asistida del token OAuth:
 powershell -ExecutionPolicy Bypass -File .\rotate_google_oauth_token.ps1 -ProjectId TU_PROJECT_ID
 ```
 El script refresca o reautentica el token, publica una nueva version en Secret Manager, corrige `FACTURADOR_WATCH_TOPIC` usando el `project_id` de `config/google_credentials.json` y valida `watch-renew` y `full-sync` via Cloud Scheduler.
+
+Cuando `FACTURADOR_TOKEN_STATE_COLLECTION` esta configurado, el servicio tambien copia el token valido a Firestore y deja de depender del mount de `/secrets/token/google_token.json` para los refresh posteriores.
 
 Configurar metricas y alertas:
 ```powershell

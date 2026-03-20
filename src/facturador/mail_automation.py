@@ -52,6 +52,9 @@ class MailAutomationConfig:
     drive_parent_folder_id: str = ""
     credentials_path: Path = Path("config/google_credentials.json")
     token_path: Path = Path("config/google_token.json")
+    token_store_project: str = ""
+    token_store_collection: str = ""
+    token_store_doc: str = "gmail_oauth_token"
     local_work_dir: Path = Path("automation_work")
     rules_path: Optional[Path] = None
     sheet_name: str = "Productos"
@@ -145,6 +148,37 @@ class MessageProcessingOutcome:
     summary: PollSummary = field(default_factory=PollSummary)
 
 
+class FirestoreOAuthTokenStore:
+    def __init__(self, project_id: str, collection_name: str, document_id: str) -> None:
+        firestore = _import_google_firestore_dep()
+        self._firestore = firestore
+        if project_id:
+            self.client = firestore.Client(project=project_id)
+        else:
+            self.client = firestore.Client()
+        self.doc_ref = self.client.collection(collection_name).document(document_id)
+
+    def load_token_json(self) -> Optional[str]:
+        snapshot = self.doc_ref.get()
+        if not snapshot.exists:
+            return None
+        data = snapshot.to_dict() or {}
+        token_json = data.get("token_json")
+        if not token_json:
+            return None
+        return str(token_json)
+
+    def save_token_json(self, token_json: str, source: str) -> None:
+        self.doc_ref.set(
+            {
+                "token_json": token_json,
+                "source": source,
+                "updated_at": self._firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+
 def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -220,6 +254,9 @@ def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationCo
 
     cfg.credentials_path = credentials or (base / "config" / "google_credentials.json")
     cfg.token_path = token or (base / "config" / "google_token.json")
+    cfg.token_store_project = str(payload.get("token_store_project", cfg.token_store_project)).strip()
+    cfg.token_store_collection = str(payload.get("token_store_collection", cfg.token_store_collection)).strip()
+    cfg.token_store_doc = str(payload.get("token_store_doc", cfg.token_store_doc)).strip() or cfg.token_store_doc
     cfg.local_work_dir = local_dir or (base / "automation_work")
     cfg.rules_path = rules
 
@@ -253,6 +290,8 @@ def load_mail_automation_config(path: Optional[Path] = None) -> MailAutomationCo
             raise AutomationError("entered_drive_subfolder_name no puede ser vacio cuando sync_entered_label=true.")
     if cfg.rounding_mode not in {"up", "down", "nearest"}:
         raise AutomationError("rounding_mode invalido. Debe ser: up, down o nearest.")
+    if cfg.token_store_collection and not cfg.token_store_doc:
+        raise AutomationError("token_store_doc no puede ser vacio cuando token_store_collection esta configurado.")
 
     return cfg
 
@@ -281,6 +320,17 @@ def _import_google_storage_dep():
             "Ejecuta: pip install -r requirements.txt"
         ) from exc
     return storage
+
+
+def _import_google_firestore_dep():
+    try:
+        from google.cloud import firestore
+    except ImportError as exc:
+        raise AutomationError(
+            "Falta dependencia de Google Cloud Firestore.\n"
+            "Ejecuta: pip install -r requirements.txt"
+        ) from exc
+    return firestore
 
 
 def _safe_name(value: str) -> str:
@@ -400,6 +450,7 @@ class MailAutomationService:
         self.config.local_work_dir.mkdir(parents=True, exist_ok=True)
         (self.config.local_work_dir / "incoming").mkdir(parents=True, exist_ok=True)
         (self.config.local_work_dir / "output").mkdir(parents=True, exist_ok=True)
+        self._token_store = self._build_token_store()
         self.gmail, self.drive, self.google_credentials = self._build_google_services()
         self._storage_client = None
         self._drive_lock = threading.RLock()
@@ -415,21 +466,27 @@ class MailAutomationService:
     def _build_google_services(self):
         Request, Credentials, InstalledAppFlow, build, _ = _import_google_deps()
 
-        creds = None
+        creds = self._load_credentials_from_token_store(Credentials)
+        loaded_from = "token_store" if creds is not None else ""
         force_interactive_reauth = False
-        if self.config.token_path.exists():
-            creds = Credentials.from_authorized_user_file(str(self.config.token_path), GMAIL_DRIVE_SCOPES)
+        if creds is None and self.config.token_path.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(str(self.config.token_path), GMAIL_DRIVE_SCOPES)
+                loaded_from = "token_file"
+            except Exception as exc:
+                LOGGER.warning("No se pudo leer token OAuth desde %s (%s).", self.config.token_path, exc)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
+                    self._persist_oauth_credentials(creds, source="refresh")
                 except Exception as exc:
                     if _is_oauth_invalid_grant(exc):
                         if _is_cloud_runtime():
                             raise OAuthTokenInvalidError(
                                 "Token OAuth de Google expirado o revocado (invalid_grant). "
-                                "Renueva el token en Secret Manager para reactivar el servicio.",
+                                "Reautentica la cuenta y actualiza el token bootstrap para reactivar el servicio.",
                             ) from exc
                         LOGGER.warning(
                             "Token OAuth invalido (invalid_grant). Se iniciara reautenticacion interactiva local."
@@ -446,20 +503,80 @@ class MailAutomationService:
                     )
                 flow = InstalledAppFlow.from_client_secrets_file(str(self.config.credentials_path), GMAIL_DRIVE_SCOPES)
                 creds = flow.run_local_server(port=0)
-
-            try:
-                self.config.token_path.parent.mkdir(parents=True, exist_ok=True)
-                self.config.token_path.write_text(creds.to_json(), encoding="utf-8")
-            except OSError as exc:
-                LOGGER.warning(
-                    "No se pudo persistir token OAuth en %s (%s). Se continua con credenciales en memoria.",
-                    self.config.token_path,
-                    exc,
-                )
+                self._persist_oauth_credentials(creds, source="interactive")
+        elif loaded_from == "token_file":
+            # Backfill bootstrap token into Firestore so refreshes do not depend on a read-only secret mount.
+            self._persist_oauth_credentials(creds, source="bootstrap_file")
 
         gmail = build("gmail", "v1", credentials=creds, cache_discovery=False)
         drive = build("drive", "v3", credentials=creds, cache_discovery=False)
         return gmail, drive, creds
+
+    def _build_token_store(self) -> Optional[FirestoreOAuthTokenStore]:
+        if not self.config.token_store_collection:
+            return None
+        try:
+            return FirestoreOAuthTokenStore(
+                project_id=self.config.token_store_project,
+                collection_name=self.config.token_store_collection,
+                document_id=self.config.token_store_doc,
+            )
+        except Exception as exc:
+            LOGGER.warning("No se pudo inicializar token store OAuth en Firestore (%s).", exc)
+            return None
+
+    def _load_credentials_from_token_store(self, Credentials):
+        if self._token_store is None:
+            return None
+
+        try:
+            token_json = self._token_store.load_token_json()
+        except Exception as exc:
+            LOGGER.warning("No se pudo leer token OAuth desde Firestore (%s).", exc)
+            return None
+
+        if not token_json:
+            return None
+
+        try:
+            payload = json.loads(token_json)
+            if not isinstance(payload, dict):
+                raise ValueError("token_json no es un objeto JSON")
+            return Credentials.from_authorized_user_info(payload, GMAIL_DRIVE_SCOPES)
+        except Exception as exc:
+            LOGGER.warning("Token OAuth almacenado en Firestore es invalido (%s).", exc)
+            return None
+
+    def _persist_oauth_credentials(self, creds, source: str) -> None:
+        token_json = creds.to_json()
+        stored_in_firestore = False
+
+        if self._token_store is not None:
+            try:
+                self._token_store.save_token_json(token_json, source=source)
+                stored_in_firestore = True
+            except Exception as exc:
+                LOGGER.warning("No se pudo persistir token OAuth en Firestore (%s).", exc)
+
+        if stored_in_firestore and self._is_secret_mount_path(self.config.token_path):
+            return
+
+        try:
+            self.config.token_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config.token_path.write_text(token_json, encoding="utf-8")
+        except OSError as exc:
+            level = logging.INFO if stored_in_firestore else logging.WARNING
+            LOGGER.log(
+                level,
+                "No se pudo persistir token OAuth en %s (%s).%s",
+                self.config.token_path,
+                exc,
+                " Firestore conserva el token vigente." if stored_in_firestore else " Se continua con credenciales en memoria.",
+            )
+
+    def _is_secret_mount_path(self, path: Path) -> bool:
+        normalized = str(path).replace("\\", "/")
+        return normalized.startswith("/secrets/")
 
     def _ensure_gmail_label(self, label_name: str) -> str:
         labels_resp = execute_google_with_retry(

@@ -12,6 +12,10 @@ Facturador deja de procesar y en Cloud Run aparecen errores:
 
 El refresh token de OAuth (Gmail/Drive) fue revocado o expiro.
 
+Nota importante:
+- si el OAuth consent screen esta en `Testing` y el proyecto es `External`, Google puede emitir refresh tokens con vencimiento de 7 dias para scopes de Gmail/Drive;
+- mover el almacenamiento del token ayuda a la continuidad operativa, pero no elimina por si solo ese vencimiento.
+
 ## Recuperacion inmediata
 
 1. Ejecuta la rotacion asistida:
@@ -20,6 +24,7 @@ El refresh token de OAuth (Gmail/Drive) fue revocado o expiro.
 2. Verifica en logs:
    - sin nuevos `invalid_grant`
    - jobs Scheduler exitosos en siguientes ciclos.
+   - token actualizado en Firestore si `FACTURADOR_TOKEN_STATE_COLLECTION` esta configurado.
 
 ## Recuperacion manual (fallback)
 
@@ -45,7 +50,8 @@ El refresh token de OAuth (Gmail/Drive) fue revocado o expiro.
 ## Prevencion recomendada
 
 1. Publica OAuth Consent Screen en **Production**.
-2. Mantener monitoreo de:
+2. Configura `FACTURADOR_TOKEN_STATE_COLLECTION` y `FACTURADOR_TOKEN_STATE_DOC` para persistir el refresh token en Firestore.
+3. Mantener monitoreo de:
    - errores `invalid_grant`
    - fallos de Scheduler (`watch-renew`, `full-sync`)
    - salud degradada (`/healthz` con `automation_ready=false`).

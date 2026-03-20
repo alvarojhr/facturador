@@ -171,6 +171,9 @@ class GmailPushProcessor:
     def _apply_env_overrides(self, config: MailAutomationConfig) -> MailAutomationConfig:
         credentials_path = _str_env("FACTURADOR_CREDENTIALS_PATH")
         token_path = _str_env("FACTURADOR_TOKEN_PATH")
+        token_store_project = _str_env("FACTURADOR_TOKEN_STATE_PROJECT")
+        token_store_collection = _str_env("FACTURADOR_TOKEN_STATE_COLLECTION")
+        token_store_doc = _str_env("FACTURADOR_TOKEN_STATE_DOC")
         drive_folder_id = _str_env("FACTURADOR_DRIVE_PARENT_FOLDER_ID")
         local_work_dir = _str_env("FACTURADOR_LOCAL_WORK_DIR")
         rules_path = _str_env("FACTURADOR_RULES_PATH")
@@ -181,6 +184,12 @@ class GmailPushProcessor:
             config.credentials_path = Path(credentials_path)
         if token_path:
             config.token_path = Path(token_path)
+        if token_store_project:
+            config.token_store_project = token_store_project
+        if token_store_collection:
+            config.token_store_collection = token_store_collection
+        if token_store_doc:
+            config.token_store_doc = token_store_doc
         if drive_folder_id:
             config.drive_parent_folder_id = drive_folder_id
         if local_work_dir:

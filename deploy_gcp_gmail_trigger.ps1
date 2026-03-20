@@ -20,6 +20,9 @@ param(
     [string]$PubSubPushServiceAccountName = "facturador-pubsub-push-sa",
     [string]$StateCollection = "facturador_state",
     [string]$StateDoc = "gmail_watch",
+    [string]$TokenStateProject = "",
+    [string]$TokenStateCollection = "facturador_state",
+    [string]$TokenStateDoc = "gmail_oauth_token",
     [string]$WatchLabelIds = "INBOX",
     [string]$WatchSyncAfterStart = "false",
     [int]$SyncMaxCycles = 5,
@@ -205,6 +208,10 @@ if (-not $projectNumber) {
     throw "No se pudo obtener project number de $ProjectId"
 }
 
+if (-not $TokenStateProject) {
+    $TokenStateProject = $ProjectId
+}
+
 if (-not $ArtifactsBucketName) {
     $ArtifactsBucketName = "$ProjectId-artifacts-$projectNumber"
 }
@@ -309,7 +316,7 @@ gcloud run deploy $ServiceName `
     --max-instances 1 `
     --port 8080 `
     --labels "app=facturador,component=mail-trigger,environment=preprod" `
-    --set-env-vars "FACTURADOR_AUTOMATION_CONFIG_PATH=/secrets/config/mail_automation.json,FACTURADOR_CREDENTIALS_PATH=/secrets/oauth/google_credentials.json,FACTURADOR_TOKEN_PATH=/secrets/token/google_token.json,FACTURADOR_STATE_COLLECTION=$StateCollection,FACTURADOR_STATE_DOC=$StateDoc,FACTURADOR_WATCH_TOPIC=projects/$watchTopicProject/topics/$TopicName,FACTURADOR_WATCH_LABEL_IDS=$WatchLabelIds,FACTURADOR_WATCH_SYNC_AFTER_START=$WatchSyncAfterStart,FACTURADOR_SYNC_MAX_CYCLES=$SyncMaxCycles" `
+    --set-env-vars "FACTURADOR_AUTOMATION_CONFIG_PATH=/secrets/config/mail_automation.json,FACTURADOR_CREDENTIALS_PATH=/secrets/oauth/google_credentials.json,FACTURADOR_TOKEN_PATH=/secrets/token/google_token.json,FACTURADOR_STATE_COLLECTION=$StateCollection,FACTURADOR_STATE_DOC=$StateDoc,FACTURADOR_TOKEN_STATE_PROJECT=$TokenStateProject,FACTURADOR_TOKEN_STATE_COLLECTION=$TokenStateCollection,FACTURADOR_TOKEN_STATE_DOC=$TokenStateDoc,FACTURADOR_WATCH_TOPIC=projects/$watchTopicProject/topics/$TopicName,FACTURADOR_WATCH_LABEL_IDS=$WatchLabelIds,FACTURADOR_WATCH_SYNC_AFTER_START=$WatchSyncAfterStart,FACTURADOR_SYNC_MAX_CYCLES=$SyncMaxCycles" `
     --set-secrets "FACTURADOR_ADMIN_TOKEN=${AdminTokenSecretName}:latest" `
     --set-secrets "/secrets/config/mail_automation.json=${ConfigSecretName}:latest" `
     --set-secrets "/secrets/oauth/google_credentials.json=${CredentialsSecretName}:latest" `
