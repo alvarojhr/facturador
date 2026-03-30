@@ -10,6 +10,8 @@ param(
     [string]$CredentialsPath = "config/google_credentials.json",
     [string]$TokenPath = "config/google_token.json",
     [string]$TokenSecretName = "facturador-google-token",
+    [string]$TokenStateCollection = "facturador_state",
+    [string]$TokenStateDoc = "gmail_oauth_token",
     [switch]$SkipFullSync
 )
 
@@ -59,6 +61,22 @@ function Get-SchedulerJobStatus([string]$JobName, [string]$Location, [string]$Pr
         "--project", $Project,
         "--format", "json(lastAttemptTime,status)"
     )) | ConvertFrom-Json
+}
+
+function Remove-FirestoreOAuthToken([string]$ProjectId, [string]$Collection, [string]$Document) {
+    $accessToken = (Invoke-GcloudCapture -CommandArgs @("auth", "print-access-token", "--project", $ProjectId)).Trim()
+    $uri = "https://firestore.googleapis.com/v1/projects/$ProjectId/databases/(default)/documents/$Collection/$Document"
+    try {
+        Invoke-RestMethod -Uri $uri -Method Delete -Headers @{ Authorization = "Bearer $accessToken" } | Out-Null
+        Write-Host "Firestore token eliminado: $Collection/$Document"
+    } catch {
+        $status = $_.Exception.Response.StatusCode
+        if ($status -eq [System.Net.HttpStatusCode]::NotFound -or [int]$status -eq 404) {
+            Write-Host "Firestore token ya no existia: $Collection/$Document"
+        } else {
+            throw
+        }
+    }
 }
 
 function Wait-ForSchedulerAttempt([string]$JobName, [string]$Location, [string]$Project, [string]$PreviousAttemptTime) {
@@ -160,6 +178,10 @@ if ($LASTEXITCODE -ne 0) {
     throw ($secretOutput | Out-String).Trim()
 }
 $tokenSecretVersion = if (($secretOutput | Out-String) -match "Created version \[(\d+)\]") { $Matches[1] } else { "latest" }
+
+# Clear the stale Firestore token so the next cold start falls back to the
+# fresh Secret Manager token instead of reading the expired one from Firestore.
+Remove-FirestoreOAuthToken -ProjectId $ProjectId -Collection $TokenStateCollection -Document $TokenStateDoc
 
 $rotationTimestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"
 Invoke-GcloudCapture -CommandArgs @(
