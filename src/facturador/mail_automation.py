@@ -370,8 +370,8 @@ def _escape_drive_query_value(value: str) -> str:
 def _is_skippable_attachment_error(exc: Exception) -> bool:
     text = str(exc).lower()
     markers = [
-        "no se encontro un xml de invoice embebido",
-        "la invoice no contiene lineas de items",
+        "no se encontro un xml de invoice o creditnote embebido",
+        "el documento no contiene lineas de items",
     ]
     return any(marker in text for marker in markers)
 
@@ -983,9 +983,14 @@ class MailAutomationService:
                 discount_factor = Decimal("1") - (price_row.discount_percent / Decimal("100"))
                 unit_cost_after_discount = price_row.cost_bruto_unit * discount_factor
                 line_total = price_row.cost_neto_unit * price_row.quantity
+                try:
+                    line_number = int(str(price_row.source_line_id).strip())
+                except Exception:
+                    line_number = i
                 lines.append({
-                    "lineNumber": i,
+                    "lineNumber": line_number,
                     "description": price_row.product,
+                    "supplierReference": price_row.supplier_reference or None,
                     "quantity": float(price_row.quantity),
                     "unitCostBeforeDiscount": int(round(price_row.cost_bruto_unit)),
                     "discountPercent": float(price_row.discount_percent),
@@ -997,6 +1002,7 @@ class MailAutomationService:
                 })
 
         return {
+            "documentKind": header.document_kind or "PURCHASE_INVOICE",
             "supplier": {
                 "nit": header.supplier_id or "",
                 "name": header.supplier_name or "",
@@ -1004,6 +1010,8 @@ class MailAutomationService:
             "invoice": {
                 "invoiceNumber": header.invoice_id or "",
                 "cufe": header.cufe or "",
+                "referenceInvoiceNumber": header.reference_invoice_number or "",
+                "referenceCufe": header.reference_cufe or "",
                 "issueDate": header.issue_date or "",
                 "dueDate": header.due_date or "",
                 "subtotal": int(round(header.subtotal)),

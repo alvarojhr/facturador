@@ -26,6 +26,7 @@ class PriceRow:
     venta_bruta_unit: Decimal
     venta_neta_unit: Decimal
     source_line_id: str
+    supplier_reference: str = ""
     markup_percent: Optional[Decimal] = None
 
 
@@ -103,6 +104,7 @@ def build_price_rows(
                 venta_neta_unit=_money(venta_neta_unit),
                 venta_bruta_unit=_money(venta_bruta_unit),
                 source_line_id=line.line_id,
+                supplier_reference=line.supplier_reference,
                 markup_percent=rule.utilidad_percent if rule else None,
             )
         )

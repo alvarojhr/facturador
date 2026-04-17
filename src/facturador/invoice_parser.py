@@ -14,11 +14,17 @@ INVOICE_NS = {
     "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
 }
 
+SUPPORTED_ROOTS = {
+    "Invoice": "PURCHASE_INVOICE",
+    "CreditNote": "PURCHASE_CREDIT_NOTE",
+}
+
 
 @dataclass
 class InvoiceLine:
     line_id: str
     description: str
+    supplier_reference: str
     quantity: Decimal
     line_extension_amount: Decimal
     tax_percent: Decimal
@@ -40,6 +46,9 @@ class InvoiceHeader:
     tax_total: Decimal
     total: Decimal
     total_tax_inclusive: Decimal
+    document_kind: str = "PURCHASE_INVOICE"
+    reference_invoice_number: str = ""
+    reference_cufe: str = ""
 
 
 def _to_decimal(value: str, default: str = "0") -> Decimal:
@@ -55,20 +64,25 @@ def _local_name(tag: str) -> str:
     return tag
 
 
+def _document_kind_from_root(root: ET.Element) -> str:
+    return SUPPORTED_ROOTS.get(_local_name(root.tag), "")
+
 def _is_invoice_root(root: ET.Element) -> bool:
-    return _local_name(root.tag) == "Invoice"
+    return bool(_document_kind_from_root(root))
 
 
 def _extract_invoice_root_from_attached(root: ET.Element) -> ET.Element:
     for desc in root.findall(".//cac:Attachment/cac:ExternalReference/cbc:Description", OUTER_NS):
         payload = desc.text
-        if not payload or "<Invoice" not in payload:
+        if not payload or ("<Invoice" not in payload and "<CreditNote" not in payload):
             continue
         try:
-            return ET.fromstring(payload)
+            embedded = ET.fromstring(payload)
+            if _is_invoice_root(embedded):
+                return embedded
         except ET.ParseError:
             continue
-    raise ValueError("No se encontro un XML de Invoice embebido en el archivo.")
+    raise ValueError("No se encontro un XML de Invoice o CreditNote embebido en el archivo.")
 
 
 def extract_invoice_root_from_bytes(data: bytes) -> ET.Element:
@@ -92,10 +106,19 @@ def parse_invoice_lines(invoice_root: ET.Element) -> List[InvoiceLine]:
     Convierte las cac:InvoiceLine en objetos InvoiceLine con decimales.
     """
     lines: List[InvoiceLine] = []
-    for node in invoice_root.findall(".//cac:InvoiceLine", INVOICE_NS):
+    root_name = _local_name(invoice_root.tag)
+    line_tag = ".//cac:CreditNoteLine" if root_name == "CreditNote" else ".//cac:InvoiceLine"
+    quantity_tag = "cbc:CreditedQuantity" if root_name == "CreditNote" else "cbc:InvoicedQuantity"
+
+    for node in invoice_root.findall(line_tag, INVOICE_NS):
         line_id = (node.findtext("cbc:ID", namespaces=INVOICE_NS) or "").strip()
         description = (node.findtext("cac:Item/cbc:Description", namespaces=INVOICE_NS) or "").strip()
-        quantity = _to_decimal(node.findtext("cbc:InvoicedQuantity", namespaces=INVOICE_NS) or "0")
+        supplier_reference = (
+            node.findtext("cac:Item/cac:SellersItemIdentification/cbc:ID", namespaces=INVOICE_NS)
+            or node.findtext("cac:Item/cac:StandardItemIdentification/cbc:ID", namespaces=INVOICE_NS)
+            or ""
+        ).strip()
+        quantity = _to_decimal(node.findtext(quantity_tag, namespaces=INVOICE_NS) or "0")
         line_extension = _to_decimal(node.findtext("cbc:LineExtensionAmount", namespaces=INVOICE_NS) or "0")
         tax_percent = _to_decimal(
             node.findtext(".//cac:TaxCategory/cbc:Percent", namespaces=INVOICE_NS) or "0"
@@ -148,6 +171,7 @@ def parse_invoice_lines(invoice_root: ET.Element) -> List[InvoiceLine]:
             InvoiceLine(
                 line_id=line_id,
                 description=description,
+                supplier_reference=supplier_reference,
                 quantity=quantity,
                 line_extension_amount=line_extension,
                 tax_percent=tax_percent,
@@ -156,7 +180,7 @@ def parse_invoice_lines(invoice_root: ET.Element) -> List[InvoiceLine]:
             )
         )
     if not lines:
-        raise ValueError("La Invoice no contiene lineas de items.")
+        raise ValueError("El documento no contiene lineas de items.")
     return lines
 
 
@@ -169,6 +193,7 @@ def _first_text(node: ET.Element, paths: List[str]) -> str:
 
 
 def parse_invoice_header(invoice_root: ET.Element) -> InvoiceHeader:
+    document_kind = _document_kind_from_root(invoice_root) or "PURCHASE_INVOICE"
     supplier_name = _first_text(
         invoice_root,
         [
@@ -210,6 +235,20 @@ def parse_invoice_header(invoice_root: ET.Element) -> InvoiceHeader:
     for tax in invoice_root.findall("cac:TaxTotal", INVOICE_NS):
         tax_total += _to_decimal(tax.findtext("cbc:TaxAmount", namespaces=INVOICE_NS) or "0")
 
+    reference_invoice_number = _first_text(
+        invoice_root,
+        [
+            "cac:BillingReference/cac:InvoiceDocumentReference/cbc:ID",
+            "cac:DiscrepancyResponse/cbc:ReferenceID",
+        ],
+    )
+    reference_cufe = _first_text(
+        invoice_root,
+        [
+            "cac:BillingReference/cac:InvoiceDocumentReference/cbc:UUID",
+        ],
+    )
+
     return InvoiceHeader(
         supplier_name=supplier_name,
         supplier_id=supplier_id,
@@ -223,4 +262,7 @@ def parse_invoice_header(invoice_root: ET.Element) -> InvoiceHeader:
         tax_total=tax_total,
         total=total,
         total_tax_inclusive=total_tax_inclusive,
+        document_kind=document_kind,
+        reference_invoice_number=reference_invoice_number,
+        reference_cufe=reference_cufe,
     )
