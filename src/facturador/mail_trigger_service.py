@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import threading
 from typing import Optional
+import zipfile
 
 from flask import Flask, abort, jsonify, request
 from google.api_core.exceptions import NotFound
@@ -13,6 +14,7 @@ from google.cloud import firestore
 from googleapiclient.errors import HttpError
 
 from .mail_automation import (
+    AutomationError,
     MailAutomationConfig,
     MailAutomationService,
     OAuthTokenInvalidError,
@@ -25,6 +27,7 @@ from .mail_automation import (
 
 
 LOGGER = logging.getLogger(__name__)
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -399,6 +402,7 @@ def _oauth_unavailable_payload(exc: OAuthTokenInvalidError) -> dict:
 def create_app() -> Flask:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
     processor = GmailPushProcessor()
     operation_lock = threading.Lock()
 
@@ -504,6 +508,56 @@ def create_app() -> Flask:
         finally:
             operation_lock.release()
         return jsonify(asdict(summary)), 200
+
+    @app.post("/admin/process-zip")
+    def process_zip():
+        _require_admin_token()
+        upload = request.files.get("file")
+        if upload is None or not upload.filename:
+            return jsonify({"ok": False, "code": "missing_file", "error": "Adjunta un archivo ZIP en el campo file."}), 400
+
+        filename = Path(upload.filename).name
+        if not filename.lower().endswith(".zip"):
+            return jsonify({"ok": False, "code": "invalid_file_type", "error": "Solo se permiten archivos .zip."}), 400
+
+        data = upload.read()
+        if not data:
+            return jsonify({"ok": False, "code": "empty_file", "error": "El archivo ZIP esta vacio."}), 400
+        if len(data) > MAX_UPLOAD_BYTES:
+            return jsonify({"ok": False, "code": "file_too_large", "error": "El archivo ZIP supera el limite de 50 MB."}), 400
+
+        skip_drive = request.args.get("skip_drive", default=False, type=lambda value: str(value).lower() in {"1", "true", "yes", "on"})
+        if not operation_lock.acquire(blocking=False):
+            return jsonify({"ok": False, "code": "busy", "error": "Facturador ya esta procesando otra operacion."}), 409
+        try:
+            try:
+                mail = processor._ensure_mail()
+                result = mail.process_uploaded_zip(
+                    attachment_name=filename,
+                    data=data,
+                    runtime=RuntimeOptions(skip_drive=skip_drive, skip_ingresado_sync=True, concurrency=1),
+                    message_id=f"manual-upload:{filename}",
+                )
+            except OAuthTokenInvalidError as exc:
+                LOGGER.error("Carga manual ZIP no disponible por OAuth invalido: %s", exc)
+                LOGGER.error("facturador_health_degraded reason=%s source=admin_process_zip", exc.reason)
+                return jsonify(_oauth_unavailable_payload(exc)), 503
+            except AutomationError as exc:
+                LOGGER.warning("No se pudo ingerir el ZIP manual en ERP: %s", exc)
+                return jsonify({"ok": False, "code": "erp_ingestion_failed", "error": str(exc)}), 502
+            except (ValueError, FileNotFoundError, zipfile.BadZipFile) as exc:
+                LOGGER.warning("ZIP manual invalido o no procesable: %s", exc)
+                return jsonify({"ok": False, "code": "zip_processing_failed", "error": str(exc)}), 400
+            except Exception as exc:
+                if is_transient_google_error(exc):
+                    LOGGER.warning("Error transitorio procesando ZIP manual: %s", exc)
+                    return jsonify({"ok": False, "retryable": True, "error": str(exc)}), 503
+                LOGGER.exception("Error procesando ZIP manual: %s", exc)
+                return jsonify({"ok": False, "code": "process_zip_failed", "error": str(exc)}), 500
+        finally:
+            operation_lock.release()
+
+        return jsonify(result), 200
 
     @app.get("/admin/state")
     def state():
