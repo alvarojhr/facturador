@@ -972,6 +972,48 @@ class MailAutomationService:
         sync_metrics.gcs_ms = gcs_ms
         return result, sync_metrics
 
+    def process_uploaded_zip(
+        self,
+        attachment_name: str,
+        data: bytes,
+        runtime: RuntimeOptions,
+        message_id: str = "manual-upload",
+    ) -> dict:
+        output_base = self.config.local_work_dir / "output"
+        result = process_invoice_bytes(
+            input_name=attachment_name,
+            input_bytes=data,
+            output_path=output_base if not runtime.skip_drive else None,
+            config=self.config.pricing_config(),
+            sheet_name=self.config.sheet_name,
+            rules_path=self.config.rules_path,
+            generate_output=not runtime.skip_drive,
+        )
+
+        if not runtime.skip_drive and result.output_path is not None:
+            self._sync_folder_to_drive(result.output_path)
+
+        payload, gcs_ms = self._build_erp_payload_with_artifacts(result=result, message_id=message_id)
+        status, body, erp_ms = self._send_payload_to_erp(payload=payload, invoice_ref=result.header.invoice_id if result.header else "?")
+        response_payload: dict
+        try:
+            parsed_body = json.loads(body) if body else {}
+            response_payload = parsed_body if isinstance(parsed_body, dict) else {"response": parsed_body}
+        except Exception:
+            response_payload = {"response": body}
+
+        response_payload.setdefault("ok", 200 <= status < 300)
+        response_payload.setdefault("statusCode", status)
+        response_payload.setdefault("invoiceRef", result.invoice_ref)
+        response_payload.setdefault("metrics", {
+            "parse_ms": result.metrics.parse_ms,
+            "pricing_ms": result.metrics.pricing_ms,
+            "artifact_ms": result.metrics.artifact_ms,
+            "erp_ms": erp_ms,
+            "gcs_ms": gcs_ms,
+        })
+        return response_payload
+
     def _build_erp_payload(self, result: ProcessResult) -> dict:
         if not result.header:
             raise AutomationError("Resultado de factura sin header para ERP.")
@@ -1057,9 +1099,9 @@ class MailAutomationService:
 
         return artifacts
 
-    def _post_to_erp(self, result: ProcessResult, message_id: str) -> tuple[float, float]:
+    def _build_erp_payload_with_artifacts(self, result: ProcessResult, message_id: str) -> tuple[dict, float]:
         if not self.config.erp_base_url or not result.header:
-            return 0.0, 0.0
+            raise AutomationError("Configura erp_base_url para ingerir el ZIP en el ERP.")
 
         payload = self._build_erp_payload(result)
         gcs_ms = 0.0
@@ -1077,6 +1119,12 @@ class MailAutomationService:
                 payload["pdfFilename"] = result.pdf_filename or "invoice.pdf"
             if result.raw_xml:
                 payload["xmlRaw"] = result.raw_xml
+
+        return payload, gcs_ms
+
+    def _send_payload_to_erp(self, payload: dict, invoice_ref: str) -> tuple[int, str, float]:
+        if not self.config.erp_base_url:
+            raise AutomationError("Configura erp_base_url para ingerir el ZIP en el ERP.")
 
         url = f"{self.config.erp_base_url.rstrip('/')}/api/purchases/ingest"
         req_data = json.dumps(payload).encode("utf-8")
@@ -1097,20 +1145,28 @@ class MailAutomationService:
             except Exception:
                 pass
             raise AutomationError(
-                f"ERP devolvio HTTP {exc.code} para invoice={result.header.invoice_id or '?'} body={body}"
+                f"ERP devolvio HTTP {exc.code} para invoice={invoice_ref or '?'} body={body}"
             ) from exc
         except Exception as exc:
             raise AutomationError(
-                f"ERP ingestion failed para invoice={result.header.invoice_id or '?'}: {exc}"
+                f"ERP ingestion failed para invoice={invoice_ref or '?'}: {exc}"
             ) from exc
 
         erp_ms = (time.perf_counter() - started) * 1000
         LOGGER.info(
             "ERP ingestion OK: invoice=%s status=%s response=%s",
-            result.header.invoice_id,
+            invoice_ref,
             status,
             body[:500],
         )
+        return status, body, erp_ms
+
+    def _post_to_erp(self, result: ProcessResult, message_id: str) -> tuple[float, float]:
+        if not self.config.erp_base_url or not result.header:
+            return 0.0, 0.0
+
+        payload, gcs_ms = self._build_erp_payload_with_artifacts(result=result, message_id=message_id)
+        _, _, erp_ms = self._send_payload_to_erp(payload=payload, invoice_ref=result.header.invoice_id or "?")
         return erp_ms, gcs_ms
 
     def _sync_folder_to_drive(self, local_folder: Path) -> None:
